@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MiMo Voice Report",
+    "description": "Speak a short completion notice and a two-sentence summary through MiMo TTS, with a popup portrait and a speech bubble that types the text in step with the audio. Toggle it beside the composer."
+  }
+}

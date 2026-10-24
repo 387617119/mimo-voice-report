@@ -1,0 +1,62 @@
+{
+  "name": "mimo-voice-report",
+  "version": "1.0.2",
+  "private": false,
+  "type": "module",
+  "description": "DeepSeek Harness plugin: speak a short completion notice and a two-sentence summary through Xiaomi MiMo TTS, with a popup portrait and a speech bubble that reveals text in step with the audio.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "cordis-plugin",
+    "mimo",
+    "xiaomi-mimo",
+    "tts",
+    "text-to-speech",
+    "voice",
+    "voice-clone",
+    "voice-report"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/387617119/mimo-voice-report.git"
+  },
+  "homepage": "https://github.com/387617119/mimo-voice-report#readme",
+  "bugs": {
+    "url": "https://github.com/387617119/mimo-voice-report/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "voice-sample.mp3",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

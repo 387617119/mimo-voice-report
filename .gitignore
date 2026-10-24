@@ -1,0 +1,16 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Secrets and local-only material — never commit these
+.env
+.env.*
+*.pem
+*.key
+avatar.*
+
+# The bundled reference clip is tracked on purpose (see README);
+# ignore any extra audio you drop in locally.
+*.wav
+!voice-sample.mp3

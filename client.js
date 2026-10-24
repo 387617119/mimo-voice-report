@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
     const LANG_KEY = 'dsh.mimoVoiceReport.lang'
-    const CLIENT_VERSION = '1.9.9'
+    const CLIENT_VERSION = '1.10.0'
     const spoken = new Set()
 
     // ——— 共享视图状态：按钮写、浮层读 ———
@@ -668,11 +668,15 @@ window.__ModuleLoader__.load({
       '.mv-key-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
     ].join('\n')
 
-    /** 插件详情页里的配置卡：音色选择 + MiMo API Key。 */
+    /** 插件详情页里的配置卡：音色选择 + 称呼 + MiMo API Key。 */
     function KeySettings(props) {
       const isSummary = Boolean(props && props.view === 'summary')
       const [state, setState] = React.useState({ loading: true, keySource: '', keyHint: '' })
       const [voice, setVoice] = React.useState({ sample: '', presets: [] })
+      const [callMe, setCallMe] = React.useState('')
+      const [nick, setNick] = React.useState('')
+      // 宿主半 < 1.10.0 不认识 callMe：能读旧 /config 但存不进称呼，这里直接禁用并提示重启。
+      const [hostOld, setHostOld] = React.useState(false)
       const [value, setValue] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState('')
@@ -684,6 +688,9 @@ window.__ModuleLoader__.load({
             setState({ loading: false, keySource: String(data.keySource || ''), keyHint: String(data.keyHint || '') })
             const v = (data && data.voice) || {}
             setVoice({ sample: String(v.sample || ''), presets: Array.isArray(v.presets) ? v.presets : [] })
+            const p = (data && data.persona) || {}
+            setCallMe(String(p.callMe || ''))
+            setHostOld(!data || !data.persona)
           })
           .catch(function (error) {
             setState({ loading: false, keySource: 'error', keyHint: '' })
@@ -712,6 +719,32 @@ window.__ModuleLoader__.load({
             const v = (data && data.voice) || {}
             setVoice({ sample: String(v.sample || file), presets: Array.isArray(v.presets) ? v.presets : [] })
             setNote('音色已切换并生效')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+      function saveCall(next) {
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ callMe: next }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '保存失败'))
+              return
+            }
+            const p = (data && data.persona) || {}
+            setCallMe(String(p.callMe !== undefined ? p.callMe : next))
+            setNick('')
+            setNote('称呼已保存并生效')
           })
           .catch(function (error) {
             setBusy(false)
@@ -751,7 +784,7 @@ window.__ModuleLoader__.load({
         return h(
           'div',
           { key: 'summary', className: 'mv-key-note' },
-          'API Key 来源：',
+          '称呼：', callMe || '未设置', ' · API Key 来源：',
           source,
           hint,
           state.keySource === 'missing' ? ' · 还没配置，点开本插件的配置填写' : ''
@@ -797,6 +830,36 @@ window.__ModuleLoader__.load({
             { className: 'mv-key-note', key: 'vnote' },
             '切换后立即生效（写回本插件 config.voiceSample）。想加新音色：把 5–15 秒的 mp3/wav 丢进插件目录即可出现在这里。'
           ),
+          h('div', { className: 'mv-key-title', key: 'ct' }, '称呼'),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'crow' },
+            h('input', {
+              key: 'call',
+              type: 'text',
+              autoComplete: 'off',
+              spellCheck: false,
+              maxLength: 16,
+              placeholder: state.loading ? '读取中…' : '怎么称呼你（如：主人 / 老板 / 名字）',
+              value: nick,
+              disabled: busy || hostOld,
+              onChange: function (event) { setNick(event.target.value) },
+            }),
+            h('button', { key: 'csave', type: 'button', className: 'primary', disabled: busy || hostOld || nick.trim() === callMe, onClick: function () { saveCall(nick.trim()) } }, '保存'),
+            callMe && !hostOld
+              ? h('button', { key: 'cclear', type: 'button', disabled: busy, onClick: function () { saveCall('') } }, '清除')
+              : null,
+            note === '称呼已保存并生效'
+              ? h('span', { key: 'cok', className: 'mv-key-ok' }, '已生效')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'cnote' },
+            hostOld
+              ? '宿主半还是旧版本（重启 DSH 后这里才能保存称呼）。'
+              : h(React.Fragment, { key: 'cn' }, '当前：', callMe || '（不称呼）', '。会缀在结束提示后，如「任务完成啦，', callMe || '主人', '。」；留空则不称呼，写回本插件 config.callMe。')
+          ),
           h('div', { className: 'mv-key-title', key: 't' }, 'MiMo API Key'),
           h(
             'div',
@@ -819,7 +882,7 @@ window.__ModuleLoader__.load({
             { className: 'mv-key-note', key: 'note' },
             '当前来源：', source, hint, '。留空时按 config.apiKey → 环境变量 MIMO_API_KEY → ~/.dsh/.credentials.yaml 的顺序取用；Key 只在宿主进程使用，不会下发到浏览器。'
           ),
-          note && note !== '音色已切换并生效' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
+          note && note !== '音色已切换并生效' && note !== '称呼已保存并生效' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
         )
       )
     }

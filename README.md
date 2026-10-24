@@ -60,6 +60,7 @@ Everything lives in this package's `cordis.patch.yml` row, and most of it can be
 | `avatar` | `avatar.webp` | Portrait for the popup (png/webp/jpeg/gif); missing/empty = bubble only |
 | `style` | `''` | Optional delivery instruction sent as a `role: user` message (never spoken). Leave empty for the most faithful clone |
 | `tags` | `(俏皮 稚嫩)` | Audio style tag prepended to the text (playful + girlish-cute). `''` disables it; tags can shift timbre |
+| `callMe` | `''` | How the whale girl addresses you, appended to the opening line (任务完成啦，主人。). CJK/Latin letters, digits or `·`, up to 16 chars; empty = no address |
 | `summarizer` | `model` | `model` = rewrite with MiMo chat; `extract` = rule-based, one less API call |
 | `summaryModel` | `mimo-v2.6-flash` | Model used for the rewrite |
 | `summaryMaxChars` | `64` | Max length of the spoken summary |

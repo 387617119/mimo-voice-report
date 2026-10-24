@@ -45,6 +45,8 @@ const DEFAULTS = {
   avatar: 'avatar.webp',
   style: PERSONA_STYLE,
   tags: PERSONA_TAGS,
+  /** 播报里对你的称呼（如「主人」），缀在结束提示后："任务完成啦，主人。" */
+  callMe: '',
   maxChars: 90,
   staleMs: 25000,
   timeoutMs: 30000,
@@ -55,7 +57,7 @@ const DEFAULTS = {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.9.9'
+const VERSION = '1.10.0'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -159,7 +161,7 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
   const url = new URL(req.url || '/', 'http://127.0.0.1')
   const method = (req.method || 'GET').toUpperCase()
 
-  // ——— 设置：读当前来源 / 写入本插件的 config.apiKey 与 voiceSample ———
+  // ——— 设置：读当前来源 / 写入本插件的 config.apiKey、voiceSample、callMe ———
   if (url.pathname === '/mimo-voice/config') {
     if (method === 'GET') {
       return json(res, 200, {
@@ -168,19 +170,26 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         keyHint: maskKey(resolveApiKey(cfg)),
         config: { apiKey: maskKey(cfg.apiKey || ''), hasConfigKey: Boolean(cfg.apiKey) },
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
+        persona: { callMe: String(cfg.callMe || '').trim() },
       })
     }
     if (method !== 'POST') return json(res, 405, { ok: false, code: 'method-not-allowed' })
     const body = await readJson(req)
     const hasKey = Object.prototype.hasOwnProperty.call(body, 'apiKey')
     const hasSample = Object.prototype.hasOwnProperty.call(body, 'voiceSample')
+    const hasCall = Object.prototype.hasOwnProperty.call(body, 'callMe')
     const apiKey = hasKey ? String(body.apiKey || '').trim() : ''
     const nextSample = hasSample ? String(body.voiceSample || '').trim() : ''
+    // 称呼是念出来的：压空白、去换行、限长 16，字符集只放行中英文/数字/间隔号。
+    const nextCall = hasCall ? String(body.callMe || '').trim().replace(/\s+/g, ' ').slice(0, 16) : ''
     if (hasKey && apiKey && !/^[\x21-\x7e]{16,}$/.test(apiKey)) {
       return json(res, 400, { ok: false, code: 'bad-key', message: 'API Key 看起来不像有效值（应为 16 位以上的可见 ASCII 字符）。' })
     }
     if (hasSample && nextSample && !isKnownSample(nextSample)) {
       return json(res, 400, { ok: false, code: 'bad-sample', message: '只能选插件目录里已存在的 mp3/wav 采样。' })
+    }
+    if (hasCall && nextCall && !/^[\u4e00-\u9fa5A-Za-z0-9_· ]+$/.test(nextCall)) {
+      return json(res, 400, { ok: false, code: 'bad-address', message: '称呼只能是中文、英文、数字、「·」或空格，最长 16 个字符。' })
     }
     const configEditor = typeof editor === 'function' ? editor() : undefined
     if (!configEditor) {
@@ -195,16 +204,19 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         const next = { ...current }
         if (hasKey) next.apiKey = apiKey
         if (hasSample) next.voiceSample = nextSample
+        if (hasCall) next.callMe = nextCall
         return next
       })
       // 立即生效；下一次配置重载会用新值再 apply 一遍。
       if (hasKey) cfg.apiKey = apiKey
       if (hasSample) cfg.voiceSample = nextSample
+      if (hasCall) cfg.callMe = nextCall
       return json(res, 200, {
         ok: true,
         keySource: describeKeySource(cfg),
         keyHint: maskKey(apiKey || resolveApiKey(cfg)),
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
+        persona: { callMe: String(cfg.callMe || '').trim() },
       })
     } catch (error) {
       return json(res, 500, { ok: false, code: 'config-write-failed', message: String(error && error.message ? error.message : error) })
@@ -310,7 +322,7 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     return json(res, 200, {
       ok: true,
       version: VERSION,
-      persona: { voice: cfg.voice, style: String(cfg.style || '').slice(0, 200), tags: cfg.tags },
+      persona: { voice: cfg.voice, style: String(cfg.style || '').slice(0, 200), tags: cfg.tags, callMe: String(cfg.callMe || '').trim() },
       sample: voiceSampleInfo(cfg),
       avatar: avatarInfo(cfg),
       config: { voice: cfg.voice, model: cfg.model, baseUrl: cfg.baseUrl, maxChars: cfg.maxChars, voiceSample: cfg.voiceSample, avatar: cfg.avatar },
@@ -379,7 +391,8 @@ function messageText(message) {
 export async function buildReportText(rec, cfg = {}) {
   const kind = rec && rec.reason ? rec.reason : 'unknown'
   if (kind === 'completed' && String(cfg.summarizer || DEFAULTS.summarizer) !== 'extract') {
-    const announce = ANNOUNCE[kind]
+    // 称呼在这里生效：announce 已带称呼，dedupeAnnounce 的前缀剥离同样按它对齐。
+    const announce = announceOf(kind, cfg)
     const source = cleanText(rec.text)
     if (source.length >= 24) {
       try {
@@ -398,7 +411,7 @@ export async function buildReportText(rec, cfg = {}) {
 export function composeReport(rec, cfg = {}) {
   const maxChars = Number(cfg.maxChars) > 10 ? Number(cfg.maxChars) : DEFAULTS.maxChars
   const kind = rec && rec.reason ? rec.reason : 'unknown'
-  const announce = ANNOUNCE[kind] || ANNOUNCE.unknown
+  const announce = announceOf(kind, cfg)
 
   if (kind === 'completed') {
     const summary = summarize(rec.text, maxChars)
@@ -428,6 +441,19 @@ const ANNOUNCE = {
   'max-tokens': '长度到上限啦。',
   forked: '任务分叉好啦。',
   unknown: '这一轮结束啦。',
+}
+
+/**
+ * 结束提示 + 可选称呼。称呼统一缀在句尾（"任务完成啦，主人。"）：
+ * 比放句首更稳——"呜，任务出错了"这类带语气词的开头不会被劈开，所有结束语一个规则通吃。
+ * 空串 / 超长（>16 字）都会被收敛：空 = 不称呼，超长截断。
+ */
+export function announceOf(kind, cfg = {}) {
+  const base = ANNOUNCE[kind] || ANNOUNCE.unknown
+  const raw = cfg.callMe === undefined ? DEFAULTS.callMe : cfg.callMe
+  const address = String(raw || '').trim().replace(/\s+/g, ' ').slice(0, 16)
+  if (!address) return base
+  return base.endsWith('。') ? base.slice(0, -1) + '，' + address + '。' : base + '，' + address + '。'
 }
 
 /** 去掉 Markdown 噪声，取前一两句，控制朗读长度。 */

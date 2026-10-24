@@ -28,6 +28,11 @@
         # Audio style tag prepended to the text: playful + girlish-cute. Empty disables it.
         tags: '(俏皮 稚嫩)'
 
+        # How the whale girl addresses you in the spoken notice, appended to
+        # the opening line (e.g. 任务完成啦，主人。). Empty = no address;
+        # editable in Settings → Plugins → MiMo Voice Report.
+        callMe: ''
+
         maxChars: 90
         staleMs: 25000
 

@@ -61,8 +61,8 @@ Everything lives in this package's `cordis.patch.yml` row, and most of it can be
 | `style` | `''` | Optional delivery instruction sent as a `role: user` message (never spoken). Leave empty for the most faithful clone |
 | `tags` | `(俏皮 稚嫩)` | Audio style tag prepended to the text (playful + girlish-cute). `''` disables it; tags can shift timbre |
 | `callMe` | `''` | How the whale girl addresses you, appended to the opening line (任务完成啦，主人。). CJK/Latin letters, digits or `·`, up to 16 chars; empty = no address |
-| `customAnnounces` | `[]` | Your own opening lines (one per entry, max 20 × 40 chars), shuffled into the completed pool (5 built-ins). Write the address into the line itself if you want it |
-| `customOnly` | `false` | `true` = completions use only your lines, none of the built-ins |
+| `customAnnounces` | `{}` | Your own lines per bucket — `{completed, error, aborted}` (one per line, max 20 × 40 chars each) — shuffled into the matching built-in pool; "interrupted" shares the aborted bucket. Write the address into a line itself if you want it |
+| `customOnly` | `false` | `true` = a bucket with custom lines uses only yours, none of its built-ins |
 | `summarizer` | `model` | `model` = rewrite with MiMo chat; `extract` = rule-based, one less API call |
 | `summaryModel` | `mimo-v2.6-flash` | Model used for the rewrite |
 | `summaryMaxChars` | `64` | Max length of the spoken summary |

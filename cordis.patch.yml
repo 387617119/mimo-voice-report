@@ -33,10 +33,15 @@
         # editable in Settings → Plugins → MiMo Voice Report.
         callMe: ''
 
-        # Your own opening lines (one per entry), shuffled into the
-        # "completed" pool alongside five built-ins. customOnly: true uses
-        # only yours. Write the address into the line itself if you want it.
-        customAnnounces: []
+        # Your own closing lines, one per entry, shuffled into the matching
+        # built-in pool per bucket: completed / error / aborted (the
+        # "interrupted" reason shares the aborted bucket). customOnly: true
+        # makes a bucket with custom lines use only yours. Example:
+        #   customAnnounces:
+        #     completed: ['鱼干已备好，请查收。']
+        #     error:     ['呜，翻车了，我再看一眼。']
+        #     aborted:   ['先搁这儿，想继续喊我。']
+        customAnnounces: {}
         customOnly: false
 
         maxChars: 90

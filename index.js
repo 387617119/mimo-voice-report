@@ -47,8 +47,8 @@ const DEFAULTS = {
   tags: PERSONA_TAGS,
   /** 播报里对你的称呼（如「主人」），缀在结束提示后："任务完成啦，主人。" */
   callMe: '',
-  /** 自定义结束语库：一行一句，随机并入「任务完成」的候选池；customOnly 时只用它。 */
-  customAnnounces: [],
+  /** 自定义结束语库：{completed,error,aborted} 三桶各配各的，随机并入对应内置池；customOnly 时该桶只用自定义。 */
+  customAnnounces: {},
   customOnly: false,
   maxChars: 90,
   staleMs: 25000,
@@ -60,7 +60,7 @@ const DEFAULTS = {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.11.0'
+const VERSION = '1.12.0'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -169,15 +169,16 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     if (method === 'GET') {
       return json(res, 200, {
         ok: true,
-        api: 2,
+        api: 3,
         keySource: describeKeySource(cfg),
         keyHint: maskKey(resolveApiKey(cfg)),
         config: { apiKey: maskKey(cfg.apiKey || ''), hasConfigKey: Boolean(cfg.apiKey) },
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
         persona: {
           callMe: String(cfg.callMe || '').trim(),
-          customAnnounces: normalizeCustomLines(cfg.customAnnounces),
+          customAnnounces: normalizeCustomLibrary(cfg.customAnnounces),
           customOnly: cfg.customOnly === true,
+          builtinAnnounces: builtinAnnounceLibrary(),
         },
       })
     }
@@ -199,18 +200,24 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     if (hasCall && nextCall && !/^[\u4e00-\u9fa5A-Za-z0-9_· ]+$/.test(nextCall)) {
       return json(res, 400, { ok: false, code: 'bad-address', message: '称呼只能是中文、英文、数字、「·」或空格，最长 16 个字符。' })
     }
-    // 自定义结束语库：接受数组或按行拆的字符串；最多 20 句、每句 40 字、不留控制字符。
+    // 自定义结束语库：{completed,error,aborted} 按桶配（也接受旧版平铺数组 = completed）。
+    // 每桶最多 20 句、每句 40 字、不留控制字符。
     const hasLines = Object.prototype.hasOwnProperty.call(body, 'customAnnounces')
     const hasOnly = Object.prototype.hasOwnProperty.call(body, 'customOnly')
-    let nextLines = null
+    let nextLibrary = null
     if (hasLines) {
-      const srcLines = Array.isArray(body.customAnnounces) ? body.customAnnounces : String(body.customAnnounces || '').split(/\n+/)
-      if (srcLines.filter((line) => String(line || '').trim()).length > 20) {
-        return json(res, 400, { ok: false, code: 'too-many-lines', message: '结束语最多 20 句。' })
-      }
-      nextLines = normalizeCustomLines(srcLines)
-      if (nextLines.some((line) => /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(line))) {
-        return json(res, 400, { ok: false, code: 'bad-lines', message: '结束语里有不支持的字符。' })
+      const src = body.customAnnounces
+      const rawLib = Array.isArray(src) ? { completed: src } : src && typeof src === 'object' ? src : {}
+      nextLibrary = { completed: [], error: [], aborted: [] }
+      for (const bucket of ['completed', 'error', 'aborted']) {
+        const list = Array.isArray(rawLib[bucket]) ? rawLib[bucket] : typeof rawLib[bucket] === 'string' ? rawLib[bucket].split(/\n+/) : []
+        if (list.filter((line) => String(line || '').trim()).length > 20) {
+          return json(res, 400, { ok: false, code: 'too-many-lines', message: '每类结束语最多 20 句。' })
+        }
+        nextLibrary[bucket] = normalizeCustomLines(list)
+        if (nextLibrary[bucket].some((line) => /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(line))) {
+          return json(res, 400, { ok: false, code: 'bad-lines', message: '结束语里有不支持的字符。' })
+        }
       }
     }
     const nextOnly = hasOnly ? body.customOnly === true : null
@@ -228,7 +235,7 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         if (hasKey) next.apiKey = apiKey
         if (hasSample) next.voiceSample = nextSample
         if (hasCall) next.callMe = nextCall
-        if (hasLines) next.customAnnounces = nextLines
+        if (hasLines) next.customAnnounces = nextLibrary
         if (hasOnly) next.customOnly = nextOnly
         return next
       })
@@ -236,18 +243,19 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
       if (hasKey) cfg.apiKey = apiKey
       if (hasSample) cfg.voiceSample = nextSample
       if (hasCall) cfg.callMe = nextCall
-      if (hasLines) cfg.customAnnounces = nextLines
+      if (hasLines) cfg.customAnnounces = nextLibrary
       if (hasOnly) cfg.customOnly = nextOnly
       return json(res, 200, {
         ok: true,
-        api: 2,
+        api: 3,
         keySource: describeKeySource(cfg),
         keyHint: maskKey(apiKey || resolveApiKey(cfg)),
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
         persona: {
           callMe: String(cfg.callMe || '').trim(),
-          customAnnounces: normalizeCustomLines(cfg.customAnnounces),
+          customAnnounces: normalizeCustomLibrary(cfg.customAnnounces),
           customOnly: cfg.customOnly === true,
+          builtinAnnounces: builtinAnnounceLibrary(),
         },
       })
     } catch (error) {
@@ -359,7 +367,10 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         style: String(cfg.style || '').slice(0, 200),
         tags: cfg.tags,
         callMe: String(cfg.callMe || '').trim(),
-        announce: { custom: normalizeCustomLines(cfg.customAnnounces).length, customOnly: cfg.customOnly === true },
+        announce: (() => {
+          const lib = normalizeCustomLibrary(cfg.customAnnounces)
+          return { custom: { completed: lib.completed.length, error: lib.error.length, aborted: lib.aborted.length }, customOnly: cfg.customOnly === true }
+        })(),
       },
       sample: voiceSampleInfo(cfg),
       avatar: avatarInfo(cfg),
@@ -471,9 +482,9 @@ export function composeReport(rec, cfg = {}) {
 }
 
 /**
- * 结束语库：每类结局一组候选，播报时随机挑一句，且不与该类的上一句连续重复。
- * 自定义库（cfg.customAnnounces，一行一句）只并入「任务完成」这一类；
- * cfg.customOnly 为 true 时完全用自己的句子，不再掺内置款。
+ * 内置结束语库：每类结局一组候选，播报时随机挑一句，且不与该类的上一句连续重复。
+ * 完成/出错/中止三类可再叠自定义库（cfg.customAnnounces 按 {completed,error,aborted} 分桶，
+ * 「被打断」归中止桶）；cfg.customOnly 为 true 时，配了自定义的桶只用自己的句子。
  */
 const ANNOUNCE_POOL = {
   completed: ['任务完成啦。', '搞定啦。', '收工啦。', '这轮跑完啦。', '嗯，全部做好了。'],
@@ -489,7 +500,16 @@ const ANNOUNCE_POOL = {
 /** 每类上次挑中的句子，用来避免连着两次念同一句。 */
 const lastAnnounce = {}
 
-/** 把用户配置的结束语库收敛成干净数组：接受数组，或按行拆的字符串。 */
+/** 三类可自定义的桶：完成 / 出错 / 中止（「被打断」也归入中止桶）。 */
+const CUSTOM_KINDS = ['completed', 'error', 'aborted']
+
+/** 结局类别 → 自定义桶；没有桶的类别（被拦/上限/分叉/未知）只用内置库。 */
+export function kindBucketOf(kind) {
+  if (kind === 'interrupted') return 'aborted'
+  return CUSTOM_KINDS.indexOf(kind) >= 0 ? kind : ''
+}
+
+/** 把一份结束语清单收敛成干净数组：接受数组，或按行拆的字符串。 */
 export function normalizeCustomLines(raw) {
   const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/\n+/) : []
   return list
@@ -498,11 +518,36 @@ export function normalizeCustomLines(raw) {
     .slice(0, 20)
 }
 
-/** 某类结局当前可用的候选池（内置 + 自定义；只有 completed 并入自定义）。 */
+/** 收敛用户配置的结束语库：{completed,error,aborted} 对象；旧版的平铺数组视为 completed。 */
+export function normalizeCustomLibrary(raw) {
+  const lib = { completed: [], error: [], aborted: [] }
+  if (Array.isArray(raw)) {
+    lib.completed = normalizeCustomLines(raw)
+    return lib
+  }
+  if (!raw || typeof raw !== 'object') return lib
+  for (const kind of CUSTOM_KINDS) {
+    const value = raw[kind]
+    if (Array.isArray(value) || typeof value === 'string') lib[kind] = normalizeCustomLines(value)
+  }
+  return lib
+}
+
+/** 设置卡展示用的内置默认库（三类；「被打断」的候选并进中止桶展示）。 */
+export function builtinAnnounceLibrary() {
+  return {
+    completed: ANNOUNCE_POOL.completed.slice(),
+    error: ANNOUNCE_POOL.error.slice(),
+    aborted: ANNOUNCE_POOL.aborted.concat(ANNOUNCE_POOL.interrupted),
+  }
+}
+
+/** 某类结局当前可用的候选池：内置默认库 + 该桶的自定义库（customOnly 时该桶只用自己的）。 */
 export function announcePool(kind, cfg = {}) {
   const key = ANNOUNCE_POOL[kind] ? kind : 'unknown'
-  const rawCustom = cfg.customAnnounces === undefined ? DEFAULTS.customAnnounces : cfg.customAnnounces
-  const custom = key === 'completed' ? normalizeCustomLines(rawCustom) : []
+  const rawLib = cfg.customAnnounces === undefined ? DEFAULTS.customAnnounces : cfg.customAnnounces
+  const bucket = kindBucketOf(key)
+  const custom = bucket ? normalizeCustomLibrary(rawLib)[bucket] : []
   const builtin = custom.length && cfg.customOnly === true ? [] : ANNOUNCE_POOL[key]
   return builtin.concat(custom)
 }

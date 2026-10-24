@@ -50,6 +50,9 @@ const DEFAULTS = {
   /** 自定义结束语库：{completed,error,aborted} 三桶各配各的，随机并入对应内置池；customOnly 时该桶只用自定义。 */
   customAnnounces: {},
   customOnly: false,
+  /** MiMo 不可用时的应对：播这个内置"叮"当兜底（留空禁用）；连续 3 次失败进冷却期跳过直连。 */
+  fallbackDing: 'fallback-ding.wav',
+  cooldownMs: 300000,
   maxChars: 90,
   staleMs: 25000,
   timeoutMs: 30000,
@@ -60,7 +63,7 @@ const DEFAULTS = {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.12.0'
+const VERSION = '1.13.0'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -297,10 +300,42 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
       return json(res, 200, { ...hit, cached: true })
     }
 
+    // —— MiMo 不可用的应对：冷却期内不直连，直接发兜底提示音 ——
+    const sendFallback = (kind, message) => {
+      host.fallbacks += 1
+      const ding = fallbackDingDataUrl(cfg)
+      if (!ding) {
+        return json(res, 200, { ok: false, code: 'tts-failed', kind, message, text })
+      }
+      return json(res, 200, {
+        ok: true,
+        fallback: true,
+        kind,
+        message,
+        text,
+        audio: ding.slice(ding.indexOf(',') + 1),
+        mime: 'audio/wav',
+        voice: cfg.voice,
+        model: cfg.model,
+        turn: rec.turn,
+        reason: rec.reason,
+        endedAt: rec.endedAt,
+        cached: false,
+      })
+    }
+
+    if (!body.force && mimoBreaker.open('tts')) {
+      const kind = mimoBreaker.kind('tts') || 'cooldown'
+      host.lastError = { at: Date.now(), kind, message: `MiMo 连续失败，冷却中（${kind}）` }
+      return sendFallback('cooldown', 'MiMo 连续失败，冷却中；稍后自动恢复，点小喇叭可立即重试')
+    }
+
     try {
       const audio = await synthesize(text, cfg)
+      mimoBreaker.success('tts')
       const payload = {
         ok: true,
+        fallback: false,
         text,
         audio,
         mime: 'audio/mpeg',
@@ -317,14 +352,11 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
       host.lastReport = { at: Date.now(), sessionId, text, turn: rec.turn, bytes: audio.length }
       return json(res, 200, payload)
     } catch (error) {
+      const info = classifyMimoError(error)
+      mimoBreaker.fail('tts', info.kind, cfg)
       host.failures += 1
-      host.lastError = { at: Date.now(), message: String(error && error.message ? error.message : error) }
-      return json(res, 200, {
-        ok: false,
-        code: 'tts-failed',
-        message: host.lastError.message,
-        text,
-      })
+      host.lastError = { at: Date.now(), kind: info.kind, message: info.message }
+      return sendFallback(info.kind, `${info.message}；已用提示音代替`)
     }
   }
 
@@ -335,9 +367,15 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     if (!text) return json(res, 400, { ok: false, code: 'missing-text' })
     try {
       const audio = await synthesize(text, cfg)
+      mimoBreaker.success('tts')
       return json(res, 200, { ok: true, text, audio, mime: 'audio/mpeg', voice: cfg.voice, cached: false })
     } catch (error) {
-      return json(res, 200, { ok: false, code: 'tts-failed', message: String(error && error.message ? error.message : error) })
+      // 试听端点不兜底提示音（它就是要验证 MiMo 本身），但要计数、要给出具体原因。
+      const info = classifyMimoError(error)
+      mimoBreaker.fail('tts', info.kind, cfg)
+      host.failures += 1
+      host.lastError = { at: Date.now(), kind: info.kind, message: info.message }
+      return json(res, 200, { ok: false, code: 'tts-failed', kind: info.kind, message: info.message })
     }
   }
 
@@ -383,6 +421,12 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
       lastReport: host.lastReport,
       lastError: host.lastError,
       lastClient: host.lastClient,
+      mimo: {
+        tts: mimoBreaker.state().tts,
+        summary: mimoBreaker.state().summary,
+        fallbacks: host.fallbacks,
+        ding: Boolean(fallbackDingDataUrl(cfg)),
+      },
     })
   }
 
@@ -403,6 +447,7 @@ function createHostState() {
   return {
     reports: 0,
     failures: 0,
+    fallbacks: 0,
     sessionCount: 0,
     lastReport: null,
     lastError: null,
@@ -439,17 +484,20 @@ function messageText(message) {
  */
 export async function buildReportText(rec, cfg = {}) {
   const kind = rec && rec.reason ? rec.reason : 'unknown'
-  if (kind === 'completed' && String(cfg.summarizer || DEFAULTS.summarizer) !== 'extract') {
+  // 熔断打开时跳过模型改写，直接走抽取式——冷却期里不再白等一次注定失败（或超时）的请求。
+  if (kind === 'completed' && String(cfg.summarizer || DEFAULTS.summarizer) !== 'extract' && !mimoBreaker.open('summary')) {
     // 称呼在这里生效：announce 已带称呼，dedupeAnnounce 的前缀剥离同样按它对齐。
     const announce = announceOf(kind, cfg)
     const source = cleanText(rec.text)
     if (source.length >= 24) {
       try {
         const spoken = await summarizeWithModel(source, cfg, announce)
+        mimoBreaker.success('summary')
         const deduped = spoken ? dedupeAnnounce(spoken, announce) : ''
         if (deduped) return announce + deduped
-      } catch {
-        // 退回抽取式摘要，播报不能因为改写失败而消失。
+      } catch (error) {
+        // 摘要模型不可用就记入熔断，然后退回抽取式——播报不能因为改写失败而消失。
+        mimoBreaker.fail('summary', classifyMimoError(error).kind, cfg)
       }
     }
   }
@@ -765,11 +813,105 @@ export function dedupeAnnounce(spoken, announce = '') {
   return text.trim()
 }
 
-/** 调用 MiMo-TTS，返回 base64 mp3。 */
+/**
+ * MiMo 错误分类：路由层和摘要层共用，让"不可用"有具体原因可提示、可熔断。
+ * kind：no-key / auth / quota / timeout / network / server / bad-request / no-audio / unknown
+ */
+const MIMO_ERROR_MESSAGES = {
+  'no-key': '还没配置 MiMo API Key',
+  auth: 'MiMo API Key 无效或没有权限',
+  quota: 'MiMo 额度或配额用尽了',
+  timeout: 'MiMo 请求超时',
+  network: '连不上 MiMo 服务',
+  server: 'MiMo 服务端出错（5xx）',
+  'bad-request': 'MiMo 拒绝了这次请求（400）',
+  'no-audio': 'MiMo 没有返回音频数据',
+  unknown: 'MiMo 调用失败',
+}
+
+export function classifyMimoError(error) {
+  const err = error || {}
+  const status = Number(err.status || 0)
+  const raw = String(err.message || err)
+  let kind = err.mimoKind || ''
+  if (!kind) {
+    if (err.code === 'no-key' || /缺少 MiMo API Key/.test(raw)) kind = 'no-key'
+    else if (status === 401 || status === 403) kind = 'auth'
+    else if (status === 402 || status === 429) kind = 'quota'
+    else if (status >= 500) kind = 'server'
+    else if (status === 400) kind = 'bad-request'
+    else if (err.name === 'AbortError' || err.name === 'TimeoutError' || /aborted|TIMEOUT/i.test(raw)) kind = 'timeout'
+    else if (/fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ETIMEDOUT|network/i.test(raw)) kind = 'network'
+    else if (/没有音频数据/.test(raw)) kind = 'no-audio'
+    else kind = 'unknown'
+  }
+  const message = MIMO_ERROR_MESSAGES[kind] || MIMO_ERROR_MESSAGES.unknown
+  return { kind, message: raw && kind === 'unknown' ? `${message}：${raw.slice(0, 90)}` : message }
+}
+
+/**
+ * 熔断器：连续 3 次失败进入冷却期（默认 5 分钟），期间不再打 MiMo——
+ * 摘要直接走抽取式、TTS 直接发兜底提示音，避免每次播报都白等一次超时。
+ * force 请求可穿透冷却（设置卡的"重试"就是 force）。
+ */
+const BREAKER = {
+  summary: { fails: 0, until: 0, kind: '' },
+  tts: { fails: 0, until: 0, kind: '' },
+}
+
+export const mimoBreaker = {
+  state() {
+    const now = Date.now()
+    const shape = (b) => ({ fails: b.fails, open: now < b.until, cooldownUntil: b.until, lastKind: b.kind })
+    return { summary: shape(BREAKER.summary), tts: shape(BREAKER.tts) }
+  },
+  open(which) {
+    return Date.now() < BREAKER[which].until
+  },
+  kind(which) {
+    return BREAKER[which].kind
+  },
+  fail(which, kind, cfg = {}) {
+    const b = BREAKER[which]
+    b.fails += 1
+    b.kind = kind || 'unknown'
+    const ms = Number(cfg.cooldownMs) > 10000 ? Number(cfg.cooldownMs) : DEFAULTS.cooldownMs
+    if (b.fails >= 3) b.until = Date.now() + ms
+  },
+  success(which) {
+    BREAKER[which] = { fails: 0, until: 0, kind: '' }
+  },
+  resetForTest() {
+    for (const key of Object.keys(BREAKER)) BREAKER[key] = { fails: 0, until: 0, kind: '' }
+  },
+}
+
+/** 兜底提示音：MiMo 不可用时播的内置"叮"（8KB wav，随插件发布）。留空/文件缺失则返回 ''。 */
+let dingCache = { key: '', data: '' }
+
+export function fallbackDingDataUrl(cfg = {}) {
+  const rel = String(cfg.fallbackDing === undefined ? DEFAULTS.fallbackDing : cfg.fallbackDing || '')
+  if (!rel) return ''
+  const file = isAbsolute(rel) ? rel : join(HERE, rel)
+  try {
+    const info = statSync(file)
+    const key = `${file}:${info.mtimeMs}:${info.size}`
+    if (dingCache.key !== key) {
+      dingCache = { key, data: `data:audio/wav;base64,${readFileSync(file).toString('base64')}` }
+    }
+    return dingCache.data
+  } catch {
+    return ''
+  }
+}
+
+/** 调用 MiMo-TTS，返回 base64 mp3。瞬态错误（超时/网络/5xx）自动重试一次。 */
 export async function synthesize(text, cfg) {
   const apiKey = resolveApiKey(cfg)
   if (!apiKey) {
-    throw new Error('缺少 MiMo API Key：请在插件 config.apiKey、环境变量 MIMO_API_KEY 或 ~/.dsh/.credentials.yaml 的 refs 中提供。')
+    const err = new Error('缺少 MiMo API Key：请在插件 config.apiKey、环境变量 MIMO_API_KEY 或 ~/.dsh/.credentials.yaml 的 refs 中提供。')
+    err.mimoKind = 'no-key'
+    throw err
   }
   const baseUrl = String(cfg.baseUrl || DEFAULTS.baseUrl).replace(/\/+$/, '')
   const model = cfg.model || DEFAULTS.model
@@ -790,32 +932,54 @@ export async function synthesize(text, cfg) {
   }
   // voicedesign 不接受 voice 字段，只用 user message 描述音色。
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs)
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'api-key': apiKey, 'content-type': 'application/json' },
-      body: JSON.stringify({ model, messages, audio }),
-      signal: controller.signal,
-    })
-    const raw = await res.text()
-    if (!res.ok) throw new Error(`MiMo TTS HTTP ${res.status}: ${raw.slice(0, 300)}`)
-    let payload
+  const attempt = async () => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs)
     try {
-      payload = JSON.parse(raw)
-    } catch {
-      throw new Error(`MiMo TTS 返回了非 JSON 响应: ${raw.slice(0, 200)}`)
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'api-key': apiKey, 'content-type': 'application/json' },
+        body: JSON.stringify({ model, messages, audio }),
+        signal: controller.signal,
+      })
+      const raw = await res.text()
+      if (!res.ok) {
+        const error = new Error(`MiMo TTS HTTP ${res.status}: ${raw.slice(0, 300)}`)
+        error.status = res.status
+        error.body = raw
+        throw error
+      }
+      let payload
+      try {
+        payload = JSON.parse(raw)
+      } catch {
+        throw new Error(`MiMo TTS 返回了非 JSON 响应: ${raw.slice(0, 200)}`)
+      }
+      const audioBlock = payload && payload.choices && payload.choices[0] && payload.choices[0].message && payload.choices[0].message.audio
+      const data = audioBlock && audioBlock.data
+      if (typeof data !== 'string' || data.length < 32) {
+        throw new Error(`MiMo TTS 响应里没有音频数据: ${raw.slice(0, 200)}`)
+      }
+      return data
+    } finally {
+      clearTimeout(timer)
     }
-    const audioBlock = payload && payload.choices && payload.choices[0] && payload.choices[0].message && payload.choices[0].message.audio
-    const data = audioBlock && audioBlock.data
-    if (typeof data !== 'string' || data.length < 32) {
-      throw new Error(`MiMo TTS 响应里没有音频数据: ${raw.slice(0, 200)}`)
-    }
-    return data
-  } finally {
-    clearTimeout(timer)
   }
+
+  let lastError = null
+  for (let round = 0; round < 2; round++) {
+    try {
+      return await attempt()
+    } catch (error) {
+      lastError = error
+      const kind = classifyMimoError(error).kind
+      error.mimoKind = kind
+      // 只重试"再来一次可能就好"的错：超时、网络、5xx；鉴权/额度/参数错重试也没用。
+      if (round === 0 && (kind === 'timeout' || kind === 'network' || kind === 'server')) continue
+      throw error
+    }
+  }
+  throw lastError
 }
 
 /** 声音克隆采样：读取插件目录下的 mp3/wav，转成 DataURL（按 mtime+size 缓存）。 */

@@ -14,12 +14,12 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
     const LANG_KEY = 'dsh.mimoVoiceReport.lang'
-    const CLIENT_VERSION = '1.12.0'
+    const CLIENT_VERSION = '1.13.0'
     const spoken = new Set()
 
     // ——— 共享视图状态：按钮写、浮层读 ———
     const listeners = new Set()
-    const view = { visible: false, phase: 'idle', text: '', shown: 0, leaving: false }
+    const view = { visible: false, phase: 'idle', text: '', shown: 0, leaving: false, fallback: '' }
     let hideTimer = 0
     let revealRaf = 0
     let currentAudio = null
@@ -75,7 +75,7 @@ window.__ModuleLoader__.load({
 
     function showCard(patch) {
       clearTimeout(hideTimer)
-      emit(Object.assign({ visible: true, shown: 0, leaving: false }, patch))
+      emit(Object.assign({ visible: true, shown: 0, leaving: false, fallback: '' }, patch))
     }
 
     /** 按音频播放进度推进逐字显现（timeupdate 只有 ~4Hz，这里用 rAF 平滑）。 */
@@ -115,6 +115,7 @@ window.__ModuleLoader__.load({
         preparing: '正在准备语音汇报…',
         cardMeta: '鲸鱼娘 · 语音汇报',
         blockedMeta: '浏览器拦了自动播放 · 点一下小喇叭',
+        fallbackMeta: '语音暂不可用 · 已用提示音',
         close: '关闭',
         avatarAlt: '鲸鱼娘',
       },
@@ -129,6 +130,7 @@ window.__ModuleLoader__.load({
         preparing: 'Preparing the voice report…',
         cardMeta: 'Voice report',
         blockedMeta: 'Autoplay blocked · tap the speaker to retry',
+        fallbackMeta: 'TTS unavailable · chime instead',
         close: 'Close',
         avatarAlt: 'Whale girl',
       },
@@ -193,6 +195,9 @@ window.__ModuleLoader__.load({
       '.mv-card.is-blocked .mv-bubble,.mv-card.is-error .mv-bubble{border-color:var(--dsw-alias-state-warn-primary)}',
       '.mv-card.is-blocked .mv-meta,.mv-card.is-error .mv-meta{color:var(--dsw-alias-state-warn-primary)}',
       '.mv-card.is-blocked .mv-dot,.mv-card.is-error .mv-dot{background:var(--dsw-alias-state-warn-primary)}',
+      // 兜底提示音：正常播出但用警示色说明"语音暂不可用"。
+      '.mv-card.is-fallback .mv-meta{color:var(--dsw-alias-state-warn-primary)}',
+      '.mv-card.is-fallback .mv-dot{background:var(--dsw-alias-state-warn-primary)}',
       '.mv-card.is-blocked,.mv-card.is-error{animation:mv-shake .3s ease}',
       '@keyframes mv-shake{0%,100%{transform:none}25%{transform:translateX(-3px)}60%{transform:translateX(2px)}}',
       '@keyframes mv-blink{0%,100%{opacity:1}50%{opacity:0}}',
@@ -500,8 +505,16 @@ window.__ModuleLoader__.load({
               return
             }
             spoken.add(key)
-            setDetail(String(data.text || ''))
-            showCard({ phase: 'loading', text: String(data.text || ''), shown: 0 })
+            // MiMo 不可用时宿主会返回内置提示音（fallback:true）：照播，但气泡要说明原因。
+            const isFallback = data.fallback === true
+            setDetail((isFallback ? String(data.message || '') + ' · ' : '') + String(data.text || ''))
+            showCard({
+              phase: 'loading',
+              text: String(data.text || ''),
+              shown: 0,
+              fallback: isFallback ? String(data.message || L.fallbackMeta) : '',
+            })
+            if (isFallback) report({ event: 'report-fallback', sessionId: sessionId, kind: data.kind, message: data.message })
             return play(data)
           })
           .catch(function (error) {
@@ -603,7 +616,7 @@ window.__ModuleLoader__.load({
           'div',
           {
             key: 'card',
-            className: 'mv-card is-' + v.phase + (v.leaving ? ' is-leaving' : ''),
+            className: 'mv-card is-' + v.phase + (v.leaving ? ' is-leaving' : '') + (v.fallback ? ' is-fallback' : ''),
             role: 'status',
             'aria-live': 'polite',
             'aria-label': v.phase === 'loading' || !full ? L.preparing : full,
@@ -645,7 +658,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'mv-meta', key: 'meta' },
               h('span', { className: 'mv-dot', key: 'dot' }),
-              v.phase === 'blocked' ? L.blockedMeta : L.cardMeta
+              v.fallback ? L.fallbackMeta : v.phase === 'blocked' ? L.blockedMeta : L.cardMeta
             )
           )
         )

@@ -1,6 +1,6 @@
 {
   "name": "mimo-voice-report",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "private": false,
   "type": "module",
   "description": "DeepSeek Harness plugin: speak a short completion notice and a two-sentence summary through Xiaomi MiMo TTS, with a popup portrait and a speech bubble that reveals text in step with the audio.",
@@ -42,6 +42,7 @@
     "cordis.patch.yml",
     "voice-sample.mp3",
     "voice-sample-playful.mp3",
+    "fallback-ding.wav",
     "locale/*.json",
     "icon.svg",
     "README.md",

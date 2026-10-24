@@ -107,6 +107,8 @@ tags: '(俏皮 稚嫩)'
 | `callMe` | 空 | 播报里对你的称呼，缀在结束提示后（「任务完成啦，主人。」）；中英文/数字/「·」、最长 16 字，留空则不称呼 |
 | `customAnnounces` | 空 | 自定义结束语库，按 `{completed, error, aborted}` 三桶分别配（一行一句，每桶最多 20 句、每句 40 字），随机并入对应内置池；「被打断」归中止桶；想带称呼直接写进句中 |
 | `customOnly` | `false` | `true` 时配了自定义的桶只用你写的，不掺该桶内置款 |
+| `fallbackDing` | `fallback-ding.wav` | MiMo 不可用时改播的内置"叮"声（相对插件目录）；留空则静默失败 |
+| `cooldownMs` | `300000` | MiMo 连续 3 次失败后的冷却期（毫秒），期间跳过直连直接兜底；点小喇叭（force）可穿透 |
 | `summarizer` | `model` | `model` = MiMo 对话模型改写；`extract` = 纯规则抽取（少一次调用，更快） |
 | `summaryModel` | `mimo-v2.6-flash` | 负责改写的对话模型 |
 | `summaryMaxChars` | `64` | 口播稿长度上限 |

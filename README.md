@@ -63,6 +63,8 @@ Everything lives in this package's `cordis.patch.yml` row, and most of it can be
 | `callMe` | `''` | How the whale girl addresses you, appended to the opening line (任务完成啦，主人。). CJK/Latin letters, digits or `·`, up to 16 chars; empty = no address |
 | `customAnnounces` | `{}` | Your own lines per bucket — `{completed, error, aborted}` (one per line, max 20 × 40 chars each) — shuffled into the matching built-in pool; "interrupted" shares the aborted bucket. Write the address into a line itself if you want it |
 | `customOnly` | `false` | `true` = a bucket with custom lines uses only yours, none of its built-ins |
+| `fallbackDing` | `fallback-ding.wav` | Bundled chime played when MiMo is unavailable (path relative to the package); `''` disables the fallback |
+| `cooldownMs` | `300000` | Cooldown after 3 consecutive MiMo failures — the API is skipped entirely; clicking the speaker (force) bypasses it |
 | `summarizer` | `model` | `model` = rewrite with MiMo chat; `extract` = rule-based, one less API call |
 | `summaryModel` | `mimo-v2.6-flash` | Model used for the rewrite |
 | `summaryMaxChars` | `64` | Max length of the spoken summary |

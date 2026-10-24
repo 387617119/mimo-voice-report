@@ -44,6 +44,14 @@
         customAnnounces: {}
         customOnly: false
 
+        # When MiMo is unavailable: errors are classified (auth / quota /
+        # timeout / network / 5xx), transient ones retry once, and 3
+        # consecutive failures open a cooldown (cooldownMs, default 5 min)
+        # that skips the API entirely; reports fall back to the bundled
+        # chime (fallbackDing, '' disables). See the mimo section of /state.
+        fallbackDing: 'fallback-ding.wav'
+        cooldownMs: 300000
+
         maxChars: 90
         staleMs: 25000
 

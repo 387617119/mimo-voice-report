@@ -47,6 +47,9 @@ const DEFAULTS = {
   tags: PERSONA_TAGS,
   /** 播报里对你的称呼（如「主人」），缀在结束提示后："任务完成啦，主人。" */
   callMe: '',
+  /** 自定义结束语库：一行一句，随机并入「任务完成」的候选池；customOnly 时只用它。 */
+  customAnnounces: [],
+  customOnly: false,
   maxChars: 90,
   staleMs: 25000,
   timeoutMs: 30000,
@@ -57,7 +60,7 @@ const DEFAULTS = {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.10.0'
+const VERSION = '1.11.0'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -166,11 +169,16 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     if (method === 'GET') {
       return json(res, 200, {
         ok: true,
+        api: 2,
         keySource: describeKeySource(cfg),
         keyHint: maskKey(resolveApiKey(cfg)),
         config: { apiKey: maskKey(cfg.apiKey || ''), hasConfigKey: Boolean(cfg.apiKey) },
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
-        persona: { callMe: String(cfg.callMe || '').trim() },
+        persona: {
+          callMe: String(cfg.callMe || '').trim(),
+          customAnnounces: normalizeCustomLines(cfg.customAnnounces),
+          customOnly: cfg.customOnly === true,
+        },
       })
     }
     if (method !== 'POST') return json(res, 405, { ok: false, code: 'method-not-allowed' })
@@ -191,6 +199,21 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     if (hasCall && nextCall && !/^[\u4e00-\u9fa5A-Za-z0-9_· ]+$/.test(nextCall)) {
       return json(res, 400, { ok: false, code: 'bad-address', message: '称呼只能是中文、英文、数字、「·」或空格，最长 16 个字符。' })
     }
+    // 自定义结束语库：接受数组或按行拆的字符串；最多 20 句、每句 40 字、不留控制字符。
+    const hasLines = Object.prototype.hasOwnProperty.call(body, 'customAnnounces')
+    const hasOnly = Object.prototype.hasOwnProperty.call(body, 'customOnly')
+    let nextLines = null
+    if (hasLines) {
+      const srcLines = Array.isArray(body.customAnnounces) ? body.customAnnounces : String(body.customAnnounces || '').split(/\n+/)
+      if (srcLines.filter((line) => String(line || '').trim()).length > 20) {
+        return json(res, 400, { ok: false, code: 'too-many-lines', message: '结束语最多 20 句。' })
+      }
+      nextLines = normalizeCustomLines(srcLines)
+      if (nextLines.some((line) => /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(line))) {
+        return json(res, 400, { ok: false, code: 'bad-lines', message: '结束语里有不支持的字符。' })
+      }
+    }
+    const nextOnly = hasOnly ? body.customOnly === true : null
     const configEditor = typeof editor === 'function' ? editor() : undefined
     if (!configEditor) {
       return json(res, 500, { ok: false, code: 'no-config-editor', message: '这个 profile 没有 configEditor 服务，无法持久化。' })
@@ -205,18 +228,27 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         if (hasKey) next.apiKey = apiKey
         if (hasSample) next.voiceSample = nextSample
         if (hasCall) next.callMe = nextCall
+        if (hasLines) next.customAnnounces = nextLines
+        if (hasOnly) next.customOnly = nextOnly
         return next
       })
       // 立即生效；下一次配置重载会用新值再 apply 一遍。
       if (hasKey) cfg.apiKey = apiKey
       if (hasSample) cfg.voiceSample = nextSample
       if (hasCall) cfg.callMe = nextCall
+      if (hasLines) cfg.customAnnounces = nextLines
+      if (hasOnly) cfg.customOnly = nextOnly
       return json(res, 200, {
         ok: true,
+        api: 2,
         keySource: describeKeySource(cfg),
         keyHint: maskKey(apiKey || resolveApiKey(cfg)),
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
-        persona: { callMe: String(cfg.callMe || '').trim() },
+        persona: {
+          callMe: String(cfg.callMe || '').trim(),
+          customAnnounces: normalizeCustomLines(cfg.customAnnounces),
+          customOnly: cfg.customOnly === true,
+        },
       })
     } catch (error) {
       return json(res, 500, { ok: false, code: 'config-write-failed', message: String(error && error.message ? error.message : error) })
@@ -322,7 +354,13 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
     return json(res, 200, {
       ok: true,
       version: VERSION,
-      persona: { voice: cfg.voice, style: String(cfg.style || '').slice(0, 200), tags: cfg.tags, callMe: String(cfg.callMe || '').trim() },
+      persona: {
+        voice: cfg.voice,
+        style: String(cfg.style || '').slice(0, 200),
+        tags: cfg.tags,
+        callMe: String(cfg.callMe || '').trim(),
+        announce: { custom: normalizeCustomLines(cfg.customAnnounces).length, customOnly: cfg.customOnly === true },
+      },
       sample: voiceSampleInfo(cfg),
       avatar: avatarInfo(cfg),
       config: { voice: cfg.voice, model: cfg.model, baseUrl: cfg.baseUrl, maxChars: cfg.maxChars, voiceSample: cfg.voiceSample, avatar: cfg.avatar },
@@ -432,28 +470,67 @@ export function composeReport(rec, cfg = {}) {
   return announce + '细节都在对话里啦。'
 }
 
-const ANNOUNCE = {
-  completed: '任务完成啦。',
-  error: '呜，任务出错了。',
-  aborted: '任务先停在这里啦。',
-  interrupted: '任务被打断啦。',
-  blocked: '任务卡住啦，在等你点头。',
-  'max-tokens': '长度到上限啦。',
-  forked: '任务分叉好啦。',
-  unknown: '这一轮结束啦。',
+/**
+ * 结束语库：每类结局一组候选，播报时随机挑一句，且不与该类的上一句连续重复。
+ * 自定义库（cfg.customAnnounces，一行一句）只并入「任务完成」这一类；
+ * cfg.customOnly 为 true 时完全用自己的句子，不再掺内置款。
+ */
+const ANNOUNCE_POOL = {
+  completed: ['任务完成啦。', '搞定啦。', '收工啦。', '这轮跑完啦。', '嗯，全部做好了。'],
+  error: ['呜，任务出错了。', '呀，这轮出错了。', '呜呜，这轮翻车了。', '哎呀，出问题了。'],
+  aborted: ['任务先停在这里啦。', '好，先停在这里。', '这轮先到这儿啦。'],
+  interrupted: ['任务被打断啦。', '诶，被打断了。', '被叫停了啦。'],
+  blocked: ['任务卡住啦，在等你点头。', '卡住了，等你点个头。', '它在等你确认哦。'],
+  'max-tokens': ['长度到上限啦。', '说到上限啦。', '篇幅到顶啦。'],
+  forked: ['任务分叉好啦。', '分出一条岔路啦。'],
+  unknown: ['这一轮结束啦。', '这轮告一段落啦。'],
 }
 
-/**
- * 结束提示 + 可选称呼。称呼统一缀在句尾（"任务完成啦，主人。"）：
- * 比放句首更稳——"呜，任务出错了"这类带语气词的开头不会被劈开，所有结束语一个规则通吃。
- * 空串 / 超长（>16 字）都会被收敛：空 = 不称呼，超长截断。
- */
-export function announceOf(kind, cfg = {}) {
-  const base = ANNOUNCE[kind] || ANNOUNCE.unknown
+/** 每类上次挑中的句子，用来避免连着两次念同一句。 */
+const lastAnnounce = {}
+
+/** 把用户配置的结束语库收敛成干净数组：接受数组，或按行拆的字符串。 */
+export function normalizeCustomLines(raw) {
+  const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/\n+/) : []
+  return list
+    .map((line) => String(line || '').trim().replace(/\s+/g, ' ').slice(0, 40))
+    .filter(Boolean)
+    .slice(0, 20)
+}
+
+/** 某类结局当前可用的候选池（内置 + 自定义；只有 completed 并入自定义）。 */
+export function announcePool(kind, cfg = {}) {
+  const key = ANNOUNCE_POOL[kind] ? kind : 'unknown'
+  const rawCustom = cfg.customAnnounces === undefined ? DEFAULTS.customAnnounces : cfg.customAnnounces
+  const custom = key === 'completed' ? normalizeCustomLines(rawCustom) : []
+  const builtin = custom.length && cfg.customOnly === true ? [] : ANNOUNCE_POOL[key]
+  return builtin.concat(custom)
+}
+
+/** 该类结局所有候选装饰好称呼后的样子（测试 / 预览用）。 */
+export function announceAll(kind, cfg = {}) {
+  return announcePool(kind, cfg).map((line) => decorateAnnounce(line, cfg))
+}
+
+/** 称呼统一缀在句尾（"任务完成啦，主人。"）：放句首会劈开"呜，"这类语气词开头。 */
+function decorateAnnounce(base, cfg = {}) {
   const raw = cfg.callMe === undefined ? DEFAULTS.callMe : cfg.callMe
   const address = String(raw || '').trim().replace(/\s+/g, ' ').slice(0, 16)
-  if (!address) return base
+  // 句子里已经写到称呼就不再缀，避免"主人，饭好了，主人。"
+  if (!address || base.indexOf(address) >= 0) return base
   return base.endsWith('。') ? base.slice(0, -1) + '，' + address + '。' : base + '，' + address + '。'
+}
+
+/** 挑一句结束提示：随机、尽量不与上一句连续重复，然后缀上称呼。 */
+export function announceOf(kind, cfg = {}) {
+  const pool = announcePool(kind, cfg)
+  let line = pool[Math.floor(Math.random() * pool.length)] || '这一轮结束啦。'
+  if (pool.length > 1 && line === lastAnnounce[kind]) {
+    // 连重了就在"其余句子"里重挑：index+1+rand(len-1) 对 len 取模，均匀且必不同。
+    line = pool[(pool.indexOf(line) + 1 + Math.floor(Math.random() * (pool.length - 1))) % pool.length]
+  }
+  lastAnnounce[kind] = line
+  return decorateAnnounce(line, cfg)
 }
 
 /** 去掉 Markdown 噪声，取前一两句，控制朗读长度。 */
@@ -631,12 +708,12 @@ export function dedupeAnnounce(spoken, announce = '') {
   }
 
   if (announce && text.startsWith(announce)) cut(announce.length)
-  let match = /^(好的?|嗯|那)?[，,]?\s*(任务)?(已经|都)?(完成|做好|搞定)(啦|了|咯|啦～)?[。！!～~]?[，,]?\s*/.exec(text)
+  let match = /^(好的?|嗯|那)?[，,]?\s*(任务)?(已经|都)?(完成|做好|搞定|收工|跑完)(啦|了|咯|啦～)?[。！!～~]?[，,]?\s*/.exec(text)
   if (match && match[0].trim()) cut(match[0].length)
 
   // 再兜一层：第一句很短又只讲"完成了"，且后面还有内容，就整句丢掉。
   const sentences = text.split(/(?<=[。！？!?])/).map((part) => part.trim()).filter(Boolean)
-  if (sentences.length > 1 && sentences[0].length <= 14 && /(完成|做好|搞定|好啦|好了)/.test(sentences[0]) && !/\d/.test(sentences[0])) {
+  if (sentences.length > 1 && sentences[0].length <= 14 && /(完成|做好|搞定|收工|跑完|好啦|好了)/.test(sentences[0]) && !/\d/.test(sentences[0])) {
     text = sentences.slice(1).join('')
   }
 

@@ -33,6 +33,12 @@
         # editable in Settings → Plugins → MiMo Voice Report.
         callMe: ''
 
+        # Your own opening lines (one per entry), shuffled into the
+        # "completed" pool alongside five built-ins. customOnly: true uses
+        # only yours. Write the address into the line itself if you want it.
+        customAnnounces: []
+        customOnly: false
+
         maxChars: 90
         staleMs: 25000
 

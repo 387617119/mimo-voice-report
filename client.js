@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
     const LANG_KEY = 'dsh.mimoVoiceReport.lang'
-    const CLIENT_VERSION = '1.10.0'
+    const CLIENT_VERSION = '1.11.0'
     const spoken = new Set()
 
     // ——— 共享视图状态：按钮写、浮层读 ———
@@ -666,6 +666,12 @@ window.__ModuleLoader__.load({
       '.mv-key-ok{font-size:12px;color:var(--dsw-alias-state-success-primary)}',
       '.mv-key-select{height:30px;padding:0 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;outline:none}',
       '.mv-key-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+      '.mv-key-textarea{width:100%;min-height:66px;max-height:150px;padding:7px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.6;outline:none;resize:vertical;box-sizing:border-box}',
+      '.mv-key-textarea:focus{border-color:var(--dsw-alias-brand-primary)}',
+      '.mv-key-textarea:disabled{opacity:.55}',
+      '.mv-key-check{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer;user-select:none}',
+      '.mv-key-check input{width:14px;height:14px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}',
+      '.mv-key-check:has(input:disabled){cursor:default;opacity:.7}',
     ].join('\n')
 
     /** 插件详情页里的配置卡：音色选择 + 称呼 + MiMo API Key。 */
@@ -677,6 +683,11 @@ window.__ModuleLoader__.load({
       const [nick, setNick] = React.useState('')
       // 宿主半 < 1.10.0 不认识 callMe：能读旧 /config 但存不进称呼，这里直接禁用并提示重启。
       const [hostOld, setHostOld] = React.useState(false)
+      // /config 的能力标记：2 = 支持结束语库（customAnnounces / customOnly）。
+      const [hostApi, setHostApi] = React.useState(0)
+      const [lines, setLines] = React.useState('')
+      const [savedLines, setSavedLines] = React.useState(0)
+      const [onlyMine, setOnlyMine] = React.useState(false)
       const [value, setValue] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState('')
@@ -691,6 +702,11 @@ window.__ModuleLoader__.load({
             const p = (data && data.persona) || {}
             setCallMe(String(p.callMe || ''))
             setHostOld(!data || !data.persona)
+            setHostApi(Number(data && data.api) || 0)
+            const custom = Array.isArray(p.customAnnounces) ? p.customAnnounces : []
+            setLines(custom.join('\n'))
+            setSavedLines(custom.length)
+            setOnlyMine(p.customOnly === true)
           })
           .catch(function (error) {
             setState({ loading: false, keySource: 'error', keyHint: '' })
@@ -745,6 +761,35 @@ window.__ModuleLoader__.load({
             setCallMe(String(p.callMe !== undefined ? p.callMe : next))
             setNick('')
             setNote('称呼已保存并生效')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+      function saveLines() {
+        const list = lines.split(/\n+/).map(function (s) { return s.trim() }).filter(Boolean)
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ customAnnounces: list, customOnly: onlyMine }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '保存失败'))
+              return
+            }
+            const p = (data && data.persona) || {}
+            const custom = Array.isArray(p.customAnnounces) ? p.customAnnounces : list
+            setLines(custom.join('\n'))
+            setSavedLines(custom.length)
+            setOnlyMine(p.customOnly === true)
+            setNote('结束语库已保存并生效')
           })
           .catch(function (error) {
             setBusy(false)
@@ -860,6 +905,45 @@ window.__ModuleLoader__.load({
               ? '宿主半还是旧版本（重启 DSH 后这里才能保存称呼）。'
               : h(React.Fragment, { key: 'cn' }, '当前：', callMe || '（不称呼）', '。会缀在结束提示后，如「任务完成啦，', callMe || '主人', '。」；留空则不称呼，写回本插件 config.callMe。')
           ),
+          h('div', { className: 'mv-key-title', key: 'lt' }, '结束语库'),
+          h('textarea', {
+            key: 'ltext',
+            className: 'mv-key-textarea',
+            rows: 3,
+            maxLength: 900,
+            spellCheck: false,
+            placeholder: state.loading ? '读取中…' : '一行一句，随机用于「任务完成」的开场；留空用内置款。如：\n鱼干已备好，请查收。\n这一网打满了。',
+            value: lines,
+            disabled: busy || hostApi < 2,
+            onChange: function (event) { setLines(event.target.value) },
+          }),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'lrow' },
+            h(
+              'label',
+              { className: 'mv-key-check', key: 'lchk' },
+              h('input', {
+                type: 'checkbox',
+                checked: onlyMine,
+                disabled: busy || hostApi < 2,
+                onChange: function (event) { setOnlyMine(event.target.checked) },
+              }),
+              '只用我写的，不掺内置款'
+            ),
+            h('span', { key: 'lfill', style: { flex: '1 1 auto' } }),
+            h('button', { key: 'lsave', type: 'button', className: 'primary', disabled: busy || hostApi < 2, onClick: saveLines }, '保存'),
+            note === '结束语库已保存并生效'
+              ? h('span', { key: 'lok', className: 'mv-key-ok' }, '已生效')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'lnote' },
+            hostApi < 2
+              ? '宿主半还是旧版本（重启 DSH 后这里才能保存结束语库）。'
+              : h(React.Fragment, { key: 'ln' }, '只作用于「任务完成」的开场；最多 20 句、每句 40 字。当前自定义 ', String(savedLines), ' 句', onlyMine ? '（只用自定义）' : '', '。想带称呼就直接写进句子里，写了就不再自动缀。')
+          ),
           h('div', { className: 'mv-key-title', key: 't' }, 'MiMo API Key'),
           h(
             'div',
@@ -882,7 +966,7 @@ window.__ModuleLoader__.load({
             { className: 'mv-key-note', key: 'note' },
             '当前来源：', source, hint, '。留空时按 config.apiKey → 环境变量 MIMO_API_KEY → ~/.dsh/.credentials.yaml 的顺序取用；Key 只在宿主进程使用，不会下发到浏览器。'
           ),
-          note && note !== '音色已切换并生效' && note !== '称呼已保存并生效' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
+          note && note !== '音色已切换并生效' && note !== '称呼已保存并生效' && note !== '结束语库已保存并生效' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
         )
       )
     }

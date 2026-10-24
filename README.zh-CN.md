@@ -55,29 +55,37 @@ plugin_manager  action: install_bundle  target: <仓库绝对路径>
 
 装好后重载一次页面（Ctrl+R），输入框右侧会出现小喇叭。
 
-## 开箱配置：音色已经固定
+## 音色选项：原版 / 俏皮版
 
-仓库自带 `voice-sample.mp3`（约 8 秒，已做响度归一），内容是一句测试台词：
+仓库自带**两条合成采样**（都是 voice clone 生成的，不含原始录音），在「设置 → 插件 → MiMo 语音汇报 → 音色」里直接切换，
+或者改 `cordis.patch.yml` 的 `voiceSample`：
 
-> **test，test，这里是音频测试，1，2，3，4，5，上山打老虎**
+| 选项 | 文件 | 特点 |
+| --- | --- | --- |
+| **原版** | `voice-sample.mp3` | 中性演示版（默认） |
+| **俏皮版** | `voice-sample-playful.mp3` | 同一音色的俏皮演绎 |
 
-这段是**合成音频**——用 MiMo 的 voice clone，以作者选定的音色把那句测试台词念出来，
-仓库里不包含任何原始录音。默认配置就是**克隆这个音色**：
+下拉框会写回 `config.voiceSample`，切换立即生效。你丢进插件目录的任何 `*.mp3` / `*.wav` 也会出现在下拉框里
+（宿主只接受插件目录中真实存在的文件，不会随便写路径）。
 
-```yaml
-model: 'mimo-v2.5-tts-voiceclone'
-voiceSample: 'voice-sample.mp3'
-style: ''
-tags: ''
-```
+两条采样念的都是同一句测试台词：**「test，test，这里是音频测试，1，2，3，4，5，上山打老虎」**。
 
 想换音色，三种办法：
 
 | 想要的效果 | 怎么做 |
 | --- | --- |
-| 换成自己的声音 | 用 5–15 秒单人干声覆盖 `voice-sample.mp3`（宿主按 mtime 自动重读，不用重装） |
+| 换成自己的声音 | 用 5–15 秒单人干声覆盖 `voice-sample.mp3`（或新增一个文件，自动出现在下拉框） |
 | 换成 MiMo 预置音色 | `model: 'mimo-v2.5-tts'` + `voice: '冰糖'`/`茉莉`/`苏打`/`白桦`/`Mia`/`Chloe`/`Milo`/`Dean` |
-| 只改语气不改音色 | 在 `style` 里写「怎么说话」（不会念出来），例如「语速慢一点、句尾下沉」 |
+| 只改语气不改音色 | 在 `style` 里写「怎么说话」（不会念出来），或用 `tags` 标签 |
+
+默认配置：
+
+```yaml
+model: 'mimo-v2.5-tts-voiceclone'
+voiceSample: 'voice-sample.mp3'
+style: ''
+tags: '(俏皮 稚嫩)'
+```
 
 立绘没有随仓库发布（`avatar.webp` 缺失时浮层只显示气泡，不会报错）。想显示头像：
 把 `avatar.png` / `avatar.webp` 放到插件目录，`avatar: 'avatar.webp'` 即可。

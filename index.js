@@ -1,46 +1,48 @@
 /**
- * MiMo Voice Report · Host half
+ * MiMo 语音汇报 · Host half
  *
- * - Listens to `session/event` and keeps one lightweight record per session:
- *   the last assistant text of the newest turn, its end reason, and when it ended.
- * - Registers its own routes under `/mimo-voice/*` so the browser half can fetch audio
- *   with a relative URL:
- *     POST /mimo-voice/report   { sessionId, force }  → synthesize (or reuse) the report, base64 mp3
- *     POST /mimo-voice/say      { text }              → ad-hoc preview (used by self-tests)
- *     GET  /mimo-voice/config                         → which API key is in effect (masked)
- *     POST /mimo-voice/config   { apiKey }            → persist the key into this plugin's config
- *     GET  /mimo-voice/state                          → host-side snapshot (diagnostics)
- *     GET  /mimo-voice/avatar                         → the portrait shown in the popup
- *     POST/GET /mimo-voice/_client                    → browser-half diagnostics
- * - Calls MiMo TTS through the OpenAI-compatible `/chat/completions` endpoint.
+ * 职责：
+ * 1. 旁听 `session/event`，把每个会话最近一轮（turn）的结果收成一份轻量记录：
+ *    最后一条助手消息的正文、这一轮的工具调用次数、结束原因（turn/end）。
+ * 2. 在 `/mimo-voice/*` 上注册本包自己的 HTTP 路由，浏览器半用相对路径取音频：
+ *    POST /mimo-voice/report   { sessionId, force }  → 生成/复用语音，返回 base64 mp3
+ *    POST /mimo-voice/say      { text }              → 任意文本试听（自检用）
+ *    GET  /mimo-voice/state                          → 宿主侧观测快照（自检用）
+ *    POST /mimo-voice/_client                        → 浏览器半上报诊断
+ *    GET  /mimo-voice/_client                        → 读回最近一次浏览器诊断
+ * 3. 调用 MiMo-TTS（OpenAI 兼容的 /chat/completions + audio 参数）合成音频。
  *
- * API key resolution: config.apiKey → MIMO_API_KEY env → refs in $DSH_HOME/.credentials.yaml.
- * The key never leaves the host process.
+ * API Key 解析顺序：config.apiKey → 环境变量 → $DSH_HOME/.credentials.yaml 的 refs。
+ * Key 只在宿主进程使用，不下发到浏览器。
  */
-import { readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /**
- * Optional delivery instruction. Leave empty for a straight clone of the sample
- * (most faithful); fill it when you want a specific delivery, but do not describe
- * timbre here — that shifts the cloned pitch.
+ * 深海鱼娘的声线完全来自 voice-sample.mp3 的克隆。
+ * 试过加"气息稳"的语气指令：指标上更稳，但试听不如纯克隆贴原声，所以 style 保持为空。
+ * 要改语气就填 style；不要在里面写音色描述，会带偏克隆的音高。
  */
 const PERSONA_STYLE = ''
 
-const PERSONA_TAGS = ''
+const PERSONA_TAGS = '(俏皮 稚嫩)'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
+/** 随插件发布的两条采样：原版（中性）与俏皮版。 */
+const VOICE_PRESETS = [
+  { id: 'original', label: '原版', file: 'voice-sample.mp3' },
+  { id: 'playful', label: '俏皮版', file: 'voice-sample-playful.mp3' },
+]
+
 const DEFAULTS = {
   baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
-  // Out of the box this uses a built-in preset voice; switch to voiceclone + voiceSample
-  // after you put a 5–15s reference clip in the plugin directory.
-  model: 'mimo-v2.5-tts',
+  model: 'mimo-v2.5-tts-voiceclone',
   voice: '冰糖',
-  voiceSample: '',
-  avatar: '',
+  voiceSample: 'voice-sample.mp3',
+  avatar: 'avatar.webp',
   style: PERSONA_STYLE,
   tags: PERSONA_TAGS,
   maxChars: 90,
@@ -52,8 +54,8 @@ const DEFAULTS = {
   summaryMaxChars: 64,
 }
 
-const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY']
-const VERSION = '1.0.0'
+const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
+const VERSION = '1.9.6'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -157,7 +159,7 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
   const url = new URL(req.url || '/', 'http://127.0.0.1')
   const method = (req.method || 'GET').toUpperCase()
 
-  // ——— API Key 设置：读当前来源 / 写入本插件的 config.apiKey ———
+  // ——— 设置：读当前来源 / 写入本插件的 config.apiKey 与 voiceSample ———
   if (url.pathname === '/mimo-voice/config') {
     if (method === 'GET') {
       return json(res, 200, {
@@ -165,13 +167,20 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         keySource: describeKeySource(cfg),
         keyHint: maskKey(resolveApiKey(cfg)),
         config: { apiKey: maskKey(cfg.apiKey || ''), hasConfigKey: Boolean(cfg.apiKey) },
+        voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
       })
     }
     if (method !== 'POST') return json(res, 405, { ok: false, code: 'method-not-allowed' })
     const body = await readJson(req)
-    const apiKey = String(body.apiKey || '').trim()
-    if (apiKey && !/^[\x21-\x7e]{16,}$/.test(apiKey)) {
+    const hasKey = Object.prototype.hasOwnProperty.call(body, 'apiKey')
+    const hasSample = Object.prototype.hasOwnProperty.call(body, 'voiceSample')
+    const apiKey = hasKey ? String(body.apiKey || '').trim() : ''
+    const nextSample = hasSample ? String(body.voiceSample || '').trim() : ''
+    if (hasKey && apiKey && !/^[\x21-\x7e]{16,}$/.test(apiKey)) {
       return json(res, 400, { ok: false, code: 'bad-key', message: 'API Key 看起来不像有效值（应为 16 位以上的可见 ASCII 字符）。' })
+    }
+    if (hasSample && nextSample && !isKnownSample(nextSample)) {
+      return json(res, 400, { ok: false, code: 'bad-sample', message: '只能选插件目录里已存在的 mp3/wav 采样。' })
     }
     const configEditor = typeof editor === 'function' ? editor() : undefined
     if (!configEditor) {
@@ -182,10 +191,21 @@ async function handleRequest({ req, res, cfg, record, cache, host, editor }) {
         .entries()
         .find((candidate) => candidate.name === 'mimo-voice-report' || candidate.id === 'include:mimo-voice-report')
       if (!entry) return json(res, 500, { ok: false, code: 'no-entry', message: '找不到本插件在 profile 里的配置行。' })
-      await configEditor.edit(entry, (current) => ({ ...current, apiKey }))
+      await configEditor.edit(entry, (current) => {
+        const next = { ...current }
+        if (hasKey) next.apiKey = apiKey
+        if (hasSample) next.voiceSample = nextSample
+        return next
+      })
       // 立即生效；下一次配置重载会用新值再 apply 一遍。
-      cfg.apiKey = apiKey
-      return json(res, 200, { ok: true, keySource: describeKeySource(cfg), keyHint: maskKey(apiKey || resolveApiKey(cfg)) })
+      if (hasKey) cfg.apiKey = apiKey
+      if (hasSample) cfg.voiceSample = nextSample
+      return json(res, 200, {
+        ok: true,
+        keySource: describeKeySource(cfg),
+        keyHint: maskKey(apiKey || resolveApiKey(cfg)),
+        voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
+      })
     } catch (error) {
       return json(res, 500, { ok: false, code: 'config-write-failed', message: String(error && error.message ? error.message : error) })
     }
@@ -680,6 +700,28 @@ export function voiceSampleInfo(cfg = {}) {
     return { path: file, ok: true, bytes: info.size, mtime: Math.round(info.mtimeMs) }
   } catch (error) {
     return { path: '', ok: false, error: String(error && error.message ? error.message : error) }
+  }
+}
+
+/** 可选音色：随插件发布的两条采样，标出当前选中的那条。 */
+export function voicePresets(cfg = {}) {
+  const current = String(cfg.voiceSample || '')
+  return VOICE_PRESETS.map((preset) => ({
+    id: preset.id,
+    label: preset.label,
+    file: preset.file,
+    selected: current === preset.file,
+    exists: existsSync(join(HERE, preset.file)),
+  }))
+}
+
+/** 只接受插件目录里真实存在的 mp3/wav，避免把任意路径写进配置。 */
+function isKnownSample(name) {
+  if (!/^[\w.\-]+\.(mp3|wav)$/i.test(name)) return false
+  try {
+    return statSync(join(HERE, name)).isFile()
+  } catch {
+    return false
   }
 }
 

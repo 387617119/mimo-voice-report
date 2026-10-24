@@ -77,19 +77,27 @@ Three ways, in resolution order:
 
 The settings card shows the active source plus a masked hint (first 3 + last 4 characters). `GET /mimo-voice/config` never returns the full key.
 
-## Voice: bundled clip, or bring your own
+## Voice presets
 
-The repo ships `voice-sample.mp3` — a ~8 second demo that says
-**「test, test, 这里是音频测试, 1, 2, 3, 4, 5, 上山打老虎」** in this repo's demo timbre.
-It is **synthetic**: MiMo voice-clone rendered that test line from the author's chosen voice, so no original recording
-is redistributed. The default config clones this clip, which is why the plugin speaks with that timbre out of the box.
-To change it:
+The repo ships **two synthetic reference clips**, both MiMo voice-clone renders (no original recording is bundled).
+Switch between them in **Settings → Plugins → MiMo Voice Report → 音色**, or edit `voiceSample` in `cordis.patch.yml`:
+
+| Preset | File | Character |
+| --- | --- | --- |
+| 原版 (original) | `voice-sample.mp3` | Neutral demo take of the test line |
+| 俏皮版 (playful) | `voice-sample-playful.mp3` | Playful take of the same timbre |
+
+The selector writes back `config.voiceSample` and takes effect immediately. Any `*.mp3` / `*.wav` you drop next to
+`index.js` shows up in the same dropdown — the host only accepts files that actually exist in the package directory.
+
+Both clips are **synthetic**: MiMo voice-clone rendered a test line
+**「test, test, 这里是音频测试, 1, 2, 3, 4, 5, 上山打老虎」** in the author's chosen timbre. To use your own voice:
 
 | Goal | How |
 | --- | --- |
-| Use your own voice | Overwrite `voice-sample.mp3` with 5–15 s of single-speaker dry speech (the host re-reads it by mtime, no reinstall) |
-| Use a preset voice | `model: 'mimo-v2.5-tts'` + `voice: '冰糖'` (or `茉莉`, `苏打`, `白桦`, `Mia`, `Chloe`, `Milo`, `Dean`) |
-| Only change the delivery | Put an instruction in `style` (sent as `role: user`, never spoken) |
+| Use your own voice | Overwrite `voice-sample.mp3` (or add a new file) with 5–15 s of single-speaker dry speech |
+| Use a MiMo preset voice | `model: 'mimo-v2.5-tts'` + `voice: '冰糖'` (or `茉莉`, `苏打`, `白桦`, `Mia`, `Chloe`, `Milo`, `Dean`) |
+| Only change the delivery | Put an instruction in `style` (sent as `role: user`, never spoken), or a tag in `tags` |
 
 Normalize a new clip with:
 

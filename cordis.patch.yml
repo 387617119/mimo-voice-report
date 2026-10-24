@@ -6,11 +6,13 @@
         # pay-as-you-go keys use https://api.xiaomimimo.com/v1
         baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1'
 
-        # Ships with a bundled ~8s reference clip: MiMo voice-clone rendered the
-        # test line "test, test, 这里是音频测试, 1, 2, 3, 4, 5, 上山打老虎" in this
-        # repo's demo timbre (synthetic audio, no original recording is bundled).
-        # Replace voice-sample.mp3 with your own 5–15s dry speech to change it,
-        # or switch to a preset voice:
+        # Ships with two bundled reference clips, selectable in
+        # Settings → Plugins → MiMo Voice Report:
+        #   voice-sample.mp3         原版    — neutral demo take
+        #   voice-sample-playful.mp3 俏皮版  — playful take
+        # Both are synthetic (MiMo voice-clone of a test line); no original
+        # recording is bundled. Drop your own 5–15s dry speech next to index.js
+        # to add another option, or switch to a preset voice:
         #   model: 'mimo-v2.5-tts'
         #   voice: '冰糖'
         model: 'mimo-v2.5-tts-voiceclone'

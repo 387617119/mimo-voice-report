@@ -13,7 +13,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
-    const CLIENT_VERSION = '1.9.1'
+    const CLIENT_VERSION = '1.9.6'
     const spoken = new Set()
 
     // ——— 共享视图状态：按钮写、浮层读 ———
@@ -555,13 +555,16 @@ window.__ModuleLoader__.load({
       '.mv-key button.primary{background:var(--dsw-alias-brand-primary);border-color:transparent;color:#fff}',
       '.mv-key-note{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary)}',
       '.mv-key-warn{font-size:12px;color:var(--dsw-alias-state-warn-primary)}',
+      '.mv-key-ok{font-size:12px;color:var(--dsw-alias-state-success-primary)}',
+      '.mv-key-select{height:30px;padding:0 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;outline:none}',
       '.mv-key-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
     ].join('\n')
 
-    /** 插件详情页里的 "MiMo API Key" 配置卡：写入本插件 config.apiKey，空值则回落到环境变量/凭据库。 */
+    /** 插件详情页里的配置卡：音色选择 + MiMo API Key。 */
     function KeySettings(props) {
       const isSummary = Boolean(props && props.view === 'summary')
       const [state, setState] = React.useState({ loading: true, keySource: '', keyHint: '' })
+      const [voice, setVoice] = React.useState({ sample: '', presets: [] })
       const [value, setValue] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState('')
@@ -571,6 +574,8 @@ window.__ModuleLoader__.load({
           .then(function (response) { return response.json() })
           .then(function (data) {
             setState({ loading: false, keySource: String(data.keySource || ''), keyHint: String(data.keyHint || '') })
+            const v = (data && data.voice) || {}
+            setVoice({ sample: String(v.sample || ''), presets: Array.isArray(v.presets) ? v.presets : [] })
           })
           .catch(function (error) {
             setState({ loading: false, keySource: 'error', keyHint: '' })
@@ -579,6 +584,32 @@ window.__ModuleLoader__.load({
       }
 
       React.useEffect(load, [])
+
+      function pickVoice(file) {
+        if (!file) return
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ voiceSample: file }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '切换失败'))
+              return
+            }
+            const v = (data && data.voice) || {}
+            setVoice({ sample: String(v.sample || file), presets: Array.isArray(v.presets) ? v.presets : [] })
+            setNote('音色已切换并生效')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
 
       function save(next) {
         setBusy(true)
@@ -626,6 +657,38 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'mv-key', key: 'key' },
+          h('div', { className: 'mv-key-title', key: 'vt' }, '音色'),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'vrow' },
+            h(
+              'select',
+              {
+                key: 'voice',
+                className: 'mv-key-select',
+                value: voice.sample || '',
+                disabled: busy || !voice.presets.length,
+                onChange: function (event) { pickVoice(event.target.value) },
+              },
+              voice.presets.length
+                ? voice.presets.map(function (preset) {
+                    return h(
+                      'option',
+                      { key: preset.id, value: preset.file, disabled: preset.exists === false },
+                      String(preset.label || preset.id) + (preset.exists === false ? '（缺失）' : '')
+                    )
+                  })
+                : h('option', { key: 'none', value: '' }, state.loading ? '读取中…' : '没有可用采样')
+            ),
+            note === '音色已切换并生效'
+              ? h('span', { key: 'vok', className: 'mv-key-ok' }, '已切换')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'vnote' },
+            '切换后立即生效（写回本插件 config.voiceSample）。想加新音色：把 5–15 秒的 mp3/wav 丢进插件目录即可出现在这里。'
+          ),
           h('div', { className: 'mv-key-title', key: 't' }, 'MiMo API Key'),
           h(
             'div',
@@ -648,7 +711,7 @@ window.__ModuleLoader__.load({
             { className: 'mv-key-note', key: 'note' },
             '当前来源：', source, hint, '。留空时按 config.apiKey → 环境变量 MIMO_API_KEY → ~/.dsh/.credentials.yaml 的顺序取用；Key 只在宿主进程使用，不会下发到浏览器。'
           ),
-          note ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
+          note && note !== '音色已切换并生效' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
         )
       )
     }

@@ -55,7 +55,7 @@ const DEFAULTS = {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.9.6'
+const VERSION = '1.9.9'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024

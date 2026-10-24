@@ -4,7 +4,7 @@
 
 A [DeepSeek Harness](https://deepseek.com) plugin that **speaks a short completion notice and a two-sentence summary** every time a task finishes — and pops up a portrait with a speech bubble whose text types itself out in step with the audio.
 
-Powered by Xiaomi **MiMo TTS**. Ships with an 18-second reference clip, so the default setup already speaks in a cloned voice (`mimo-v2.5-tts-voiceclone`); switch one line to use a preset voice instead.
+Powered by Xiaomi **MiMo TTS**. Ships with a 7.7-second reference clip, so the default setup already speaks in a cloned voice (`mimo-v2.5-tts-voiceclone`); switch one line to use a preset voice instead.
 
 `dsh-plugin` · `deepseek-harness` · `cordis-plugin` · `mimo` · `tts` · `voice-clone`
 
@@ -54,9 +54,9 @@ Everything lives in this package's `cordis.patch.yml` row, and most of it can be
 | --- | --- | --- |
 | `baseUrl` | `https://token-plan-cn.xiaomimimo.com/v1` | OpenAI-compatible endpoint. Token-plan keys use `token-plan-cn`; pay-as-you-go keys use `https://api.xiaomimimo.com/v1` |
 | `apiKey` | `''` | MiMo API key. Empty falls back to `MIMO_API_KEY`, then `~/.dsh/.credentials.yaml` refs |
-| `model` | `mimo-v2.5-tts` | `mimo-v2.5-tts` (preset voice), `mimo-v2.5-tts-voiceclone` (clone a clip), `mimo-v2.5-tts-voicedesign` (text-designed voice; timbre drifts per call) |
+| `model` | `mimo-v2.5-tts-voiceclone` | `mimo-v2.5-tts` (preset voice), `mimo-v2.5-tts-voiceclone` (clone a clip), `mimo-v2.5-tts-voicedesign` (text-designed voice; timbre drifts per call) |
 | `voice` | `冰糖` | Preset voice: `冰糖`, `茉莉`, `苏打`, `白桦`, `Mia`, `Chloe`, `Milo`, `Dean` |
-| `voiceSample` | `''` | Reference clip for clone mode, relative to the package or absolute; mp3/wav, mono, 5–15 s of clean speech |
+| `voiceSample` | `voice-sample.mp3` | Reference clip for clone mode, relative to the package or absolute; mp3/wav, mono, 5–15 s of clean speech |
 | `avatar` | `avatar.webp` | Portrait for the popup (png/webp/jpeg/gif); missing/empty = bubble only |
 | `style` | `''` | Optional delivery instruction sent as a `role: user` message (never spoken). Leave empty for the most faithful clone |
 | `tags` | `(俏皮 稚嫩)` | Audio style tag prepended to the text (playful + girlish-cute). `''` disables it; tags can shift timbre |

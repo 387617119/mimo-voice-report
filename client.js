@@ -13,12 +13,13 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
-    const CLIENT_VERSION = '1.9.6'
+    const LANG_KEY = 'dsh.mimoVoiceReport.lang'
+    const CLIENT_VERSION = '1.9.9'
     const spoken = new Set()
 
     // ——— 共享视图状态：按钮写、浮层读 ———
     const listeners = new Set()
-    const view = { visible: false, phase: 'idle', text: '', shown: 0 }
+    const view = { visible: false, phase: 'idle', text: '', shown: 0, leaving: false }
     let hideTimer = 0
     let revealRaf = 0
     let currentAudio = null
@@ -56,17 +57,25 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function hideCardSoon(ms) {
+    /** 先播 240ms 离场动画，再真正卸载浮层。 */
+    function beginLeave() {
+      if (!view.visible || view.leaving) return
+      emit({ leaving: true })
       clearTimeout(hideTimer)
       hideTimer = setTimeout(function () {
         stopReveal()
-        emit({ visible: false, phase: 'idle', text: '', shown: 0 })
-      }, ms || 0)
+        emit({ visible: false, phase: 'idle', text: '', shown: 0, leaving: false })
+      }, 250)
+    }
+
+    function hideCardSoon(ms) {
+      clearTimeout(hideTimer)
+      hideTimer = setTimeout(beginLeave, ms || 0)
     }
 
     function showCard(patch) {
       clearTimeout(hideTimer)
-      emit(Object.assign({ visible: true, shown: 0 }, patch))
+      emit(Object.assign({ visible: true, shown: 0, leaving: false }, patch))
     }
 
     /** 按音频播放进度推进逐字显现（timeupdate 只有 ~4Hz，这里用 rAF 平滑）。 */
@@ -140,22 +149,58 @@ window.__ModuleLoader__.load({
     ].join('\n')
 
     const CARD_CSS = [
-      '.mv-card{position:fixed;right:24px;bottom:112px;z-index:80;display:flex;align-items:flex-end;gap:10px;max-width:min(430px,calc(100vw - 48px));pointer-events:none;animation:mv-card-in .22s cubic-bezier(.2,.9,.3,1.2)}',
-      '@keyframes mv-card-in{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}',
-      '.mv-figure{width:112px;height:148px;flex:0 0 auto;border-radius:14px;overflow:hidden;background:#f7f9ff;border:1px solid var(--dsw-alias-border-l1);box-shadow:0 10px 26px rgba(0,0,0,.28);pointer-events:auto}',
-      '.mv-figure img{width:100%;height:100%;object-fit:contain;object-position:50% 50%;display:block}',
-      '.mv-bubble{position:relative;min-width:140px;max-width:280px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:14px;padding:11px 30px 9px 13px;box-shadow:0 12px 30px rgba(0,0,0,.24);pointer-events:auto}',
-      '.mv-bubble:after{content:"";position:absolute;left:-6px;bottom:16px;width:12px;height:12px;background:var(--dsw-alias-bg-overlay);border-left:1px solid var(--dsw-alias-border-l1);border-bottom:1px solid var(--dsw-alias-border-l1);transform:rotate(45deg);border-bottom-left-radius:3px}',
-      '.mv-text{font-size:13.5px;line-height:1.68;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word}',
-      '.mv-caret{display:inline-block;width:2px;height:1em;margin-left:1px;vertical-align:-2px;background:currentColor;animation:mv-blink 1s steps(2,start) infinite}',
+      // 容器只管定位；入场动效放在立绘/气泡两个子元素上，气泡比立绘晚 90ms 弹出。
+      '.mv-card{position:fixed;right:24px;bottom:112px;z-index:80;display:flex;align-items:flex-end;gap:12px;max-width:min(440px,calc(100vw - 48px));pointer-events:none}',
+      '.mv-figure,.mv-bubble{animation:mv-rise .38s cubic-bezier(.18,.89,.32,1.18) both}',
+      '.mv-bubble{animation-delay:.09s}',
+      '.mv-card.is-leaving .mv-figure,.mv-card.is-leaving .mv-bubble{animation:mv-sink .24s ease forwards}',
+      '@keyframes mv-rise{from{opacity:0;transform:translateY(16px) scale(.95)}to{opacity:1;transform:none}}',
+      '@keyframes mv-sink{from{opacity:1;transform:none}to{opacity:0;transform:translateY(10px) scale(.97)}}',
+      // 品牌色光晕：垫在卡片后面，准备/播放时最亮，播完慢慢暗下去。
+      '.mv-glow{position:absolute;right:-30px;bottom:-34px;width:230px;height:190px;border-radius:50%;background:var(--dsw-alias-brand-primary);opacity:0;filter:blur(46px);pointer-events:none;z-index:-1;transition:opacity .5s ease}',
+      '.mv-card.is-loading .mv-glow,.mv-card.is-playing .mv-glow{opacity:.28}',
+      '.mv-card.is-done .mv-glow{opacity:.10}',
+      // 立绘：圆角小卡 + 顶部高光 + 呼吸浮动（img 本身在窗口里轻轻上下）。
+      '.mv-figure{position:relative;width:118px;height:154px;flex:0 0 auto;border-radius:18px;overflow:hidden;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);box-shadow:0 16px 34px rgba(0,0,0,.32);pointer-events:auto;transition:border-color .3s ease}',
+      '.mv-figure:before{content:"";position:absolute;inset:0;background:radial-gradient(130% 100% at 50% 0%,rgba(255,255,255,.16),transparent 55%);pointer-events:none;z-index:1}',
+      '.mv-figure img{width:100%;height:100%;object-fit:contain;object-position:50% 100%;display:block;animation:mv-bob 3.8s ease-in-out infinite}',
+      '.mv-card.is-playing .mv-figure{border-color:var(--dsw-alias-brand-primary)}',
+      '@keyframes mv-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}',
+      // 气泡：毛玻璃、大圆角、靠尾巴一侧收小角。
+      '.mv-bubble{position:relative;min-width:150px;max-width:300px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:18px;border-bottom-left-radius:8px;padding:12px 30px 10px 14px;box-shadow:0 18px 40px rgba(0,0,0,.30);backdrop-filter:blur(16px) saturate(1.3);-webkit-backdrop-filter:blur(16px) saturate(1.3);pointer-events:auto;transition:border-color .25s ease}',
+      '.mv-bubble:after{content:"";position:absolute;left:-5.5px;bottom:18px;width:11px;height:11px;background:var(--dsw-alias-bg-overlay);border-left:1px solid var(--dsw-alias-border-l1);border-bottom:1px solid var(--dsw-alias-border-l1);transform:rotate(45deg);border-bottom-left-radius:3px}',
+      // 正文：每个新出现的字带一次 4px 上浮。
+      '.mv-text{font-size:14px;line-height:1.75;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word;min-height:1.75em}',
+      '.mv-c{display:inline-block;animation:mv-char .24s ease both}',
+      '@keyframes mv-char{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}',
+      '.mv-caret{display:inline-block;width:2.5px;height:1em;margin-left:2px;vertical-align:-2px;border-radius:2px;background:var(--dsw-alias-brand-primary);animation:mv-blink 1s steps(2,start) infinite}',
       '.mv-dim{color:var(--dsw-alias-label-secondary)}',
-      '.mv-meta{margin-top:5px;font-size:11px;color:var(--dsw-alias-label-secondary);opacity:.85}',
-      '.mv-close{position:absolute;top:5px;right:5px;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:14px;line-height:1;cursor:pointer}',
-      '.mv-close:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}',
+      // 进度线：准备时来回扫，播放时跟音频走，播完停在满格再淡出。
+      '.mv-bar{position:relative;height:2px;margin:9px 2px 7px;border-radius:2px;background:var(--dsw-alias-border-l1);overflow:hidden;opacity:0;transition:opacity .3s ease}',
+      '.mv-card.is-loading .mv-bar,.mv-card.is-playing .mv-bar{opacity:1}',
+      '.mv-card.is-done .mv-bar{opacity:.45}',
+      '.mv-bar>i{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:2px;background:var(--dsw-alias-brand-primary);transition:width .2s linear}',
+      '.mv-card.is-loading .mv-bar>i{width:34%;animation:mv-sweep 1.1s ease-in-out infinite}',
+      '@keyframes mv-sweep{0%{left:-34%}100%{left:100%}}',
+      // 状态行：小圆点 + 说明，播放中圆点呼吸。
+      '.mv-meta{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary);opacity:.9}',
+      '.mv-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-secondary);flex:0 0 auto}',
+      '.mv-card.is-loading .mv-dot,.mv-card.is-playing .mv-dot{background:var(--dsw-alias-brand-primary);animation:mv-dot 1.2s ease-in-out infinite}',
+      '@keyframes mv-dot{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.6);opacity:.55}}',
+      '.mv-close{position:absolute;top:6px;right:6px;width:20px;height:20px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:14px;line-height:1;cursor:pointer;transition:background .15s ease,color .15s ease,transform .15s ease}',
+      '.mv-close:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);transform:scale(1.06)}',
+      // 被拦 / 出错：警示描边 + 整卡轻抖一下。
+      '.mv-card.is-blocked .mv-bubble,.mv-card.is-error .mv-bubble{border-color:var(--dsw-alias-state-warn-primary)}',
       '.mv-card.is-blocked .mv-meta,.mv-card.is-error .mv-meta{color:var(--dsw-alias-state-warn-primary)}',
+      '.mv-card.is-blocked .mv-dot,.mv-card.is-error .mv-dot{background:var(--dsw-alias-state-warn-primary)}',
+      '.mv-card.is-blocked,.mv-card.is-error{animation:mv-shake .3s ease}',
+      '@keyframes mv-shake{0%,100%{transform:none}25%{transform:translateX(-3px)}60%{transform:translateX(2px)}}',
       '@keyframes mv-blink{0%,100%{opacity:1}50%{opacity:0}}',
-      '@media (prefers-reduced-motion: reduce){.mv-card{animation:none}}',
-      '@media (max-width:720px){.mv-card{right:14px;bottom:96px;gap:8px}.mv-figure{width:88px;height:116px}.mv-bubble{max-width:calc(100vw - 150px)}}',
+      // 动效敏感用户：全部换成纯淡入淡出，浮动/呼吸/抖动一律关掉。
+      '@media (prefers-reduced-motion: reduce){.mv-figure,.mv-bubble{animation:mv-fade .18s ease both}.mv-card.is-leaving .mv-figure,.mv-card.is-leaving .mv-bubble{animation:mv-fadeout .18s ease forwards}.mv-figure img,.mv-c,.mv-card.is-blocked,.mv-card.is-error,.mv-dot,.mv-card.is-loading .mv-bar>i,.mv-caret{animation:none}}',
+      '@keyframes mv-fade{from{opacity:0}to{opacity:1}}',
+      '@keyframes mv-fadeout{from{opacity:1}to{opacity:0}}',
+      '@media (max-width:720px){.mv-card{right:14px;bottom:96px;gap:8px}.mv-figure{width:92px;height:122px;border-radius:14px}.mv-bubble{max-width:calc(100vw - 150px);border-radius:16px;border-bottom-left-radius:7px;padding:10px 26px 9px 12px}.mv-text{font-size:13.5px}}',
     ].join('\n')
 
     function readEnabled() {
@@ -183,19 +228,62 @@ window.__ModuleLoader__.load({
       } catch {}
     }
 
-    function resolveText(ctx) {
-      let id = ''
+    /** 宿主 DSH 的界面语言，例如 'zh-CN' / 'en-US'；读不到返回 ''。 */
+    function hostLocale() {
+      const svc = localeRef.current
       try {
-        const locale = typeof ctx.get === 'function' ? ctx.get('locale') : undefined
-        const snapshot = locale && (locale.getSnapshot ? locale.getSnapshot() : locale.getLocale ? locale.getLocale() : undefined)
-        if (snapshot) id = String(snapshot.locale || snapshot.id || snapshot.current || '')
+        const snap = svc && typeof svc.getSnapshot === 'function' ? svc.getSnapshot() : undefined
+        // DSH locale 服务的快照形状是 { active: 'zh-CN' }（dshmarket 也这么读）；
+        // 旧实现找的是 locale / id / current —— 真实快照上都没有，于是永远命中不了。
+        const value = snap ? String(snap.active || snap.locale || snap.id || snap.current || '') : ''
+        return value.toLowerCase()
       } catch {}
-      if (!id) {
-        try {
-          id = String(document.documentElement.lang || navigator.language || '')
-        } catch {}
+      return ''
+    }
+
+    /** 浏览器自己的偏好列表，作为宿主语言缺失时的兜底。 */
+    function browserLocales() {
+      const list = []
+      try {
+        if (typeof document !== 'undefined' && document.documentElement && document.documentElement.lang) {
+          list.push(document.documentElement.lang)
+        }
+        if (typeof navigator !== 'undefined') {
+          if (Array.isArray(navigator.languages)) list.push.apply(list, navigator.languages)
+          if (navigator.language) list.push(navigator.language)
+        }
+      } catch {}
+      return list.filter(Boolean).map(function (tag) { return String(tag).toLowerCase() })
+    }
+
+    /** 诊断用：界面语言取自哪、浏览器偏好是什么（排查"为什么是英文"）。 */
+    function localeInfo() {
+      const host = hostLocale()
+      const hints = browserLocales()
+      if (host) return { tag: host, from: 'dsh', browser: hints[0] || '' }
+      return { tag: '', from: hints.length ? 'browser-only' : 'none', browser: hints[0] || '' }
+    }
+
+    /** 手动指定语言的开关（'zh' / 'en'）；不设就是 auto。 */
+    function readLangOverride() {
+      try {
+        const raw = localStorage.getItem(LANG_KEY)
+        return raw === 'zh' || raw === 'en' ? raw : ''
+      } catch {
+        return ''
       }
-      return id.toLowerCase().indexOf('en') === 0 ? TEXT.en : TEXT.zh
+    }
+
+    /**
+     * 判定用：只有 DSH 自己说界面是英文才切英文，否则一律中文。
+     * 播报正文永远是中文（「任务完成啦。」+ 中文总结），英文字配中文声音并不配套；
+     * 而浏览器偏好（navigator.language = en-US）不代表界面语言——旧实现正是被它带偏的。
+     * 想强制某一种：控制台执行 localStorage.setItem('dsh.mimoVoiceReport.lang', 'zh'|'en'|'')。
+     */
+    function pickText() {
+      const forced = readLangOverride()
+      if (forced) return forced === 'en' ? TEXT.en : TEXT.zh
+      return /^en([-_]|$)/.test(hostLocale()) ? TEXT.en : TEXT.zh
     }
 
     function SpeakerIcon(props) {
@@ -235,7 +323,7 @@ window.__ModuleLoader__.load({
       const sessionId = props.sessionId
       const useSession = props.useSession
       const running = typeof useSession === 'function' ? useSession(function (snapshot) { return Boolean(snapshot && snapshot.running) }) : false
-      const L = textRef.current
+      const L = pickText()
       const [enabled, setEnabled] = React.useState(readEnabled)
       const [status, setStatus] = React.useState('idle')
       const [detail, setDetail] = React.useState('')
@@ -248,7 +336,8 @@ window.__ModuleLoader__.load({
       const retryCleanup = React.useRef(null)
 
       React.useEffect(function () {
-        report({ event: 'mounted', v: CLIENT_VERSION, sessionId: sessionId, enabled: readEnabled(), hasAudio: typeof Audio !== 'undefined' })
+        const loc = localeInfo()
+        report({ event: 'mounted', v: CLIENT_VERSION, sessionId: sessionId, enabled: readEnabled(), hasAudio: typeof Audio !== 'undefined', lang: pickText() === TEXT.en ? 'en' : 'zh', dshLocale: loc.tag, localeFrom: loc.from, browserLocale: loc.browser })
         const heartbeat = setInterval(function () {
           if (typeof document !== 'undefined' && document.hidden) return
           report({ event: 'heartbeat', v: CLIENT_VERSION, sessionId: sessionId, status: statusRef.current })
@@ -333,8 +422,8 @@ window.__ModuleLoader__.load({
             if (started) return
             started = true
             if (!alive.current) return
-            // 被自动播放拦下后靠用户手势补播时，浮层可能已经收起，这里重新亮出来。
-            emit({ visible: true, phase: 'playing', text: text, shown: 0 })
+            // 被自动播放拦下后靠用户手势补播时，浮层可能已在离场路上，这里重新亮出来。
+            showCard({ phase: 'playing', text: text, shown: 0 })
             startReveal(el, text)
             report({ event: 'card-playing', sessionId: sessionId, chars: Array.from(text).length, duration: Math.round((el.duration || 0) * 100) / 100 })
           }
@@ -394,7 +483,7 @@ window.__ModuleLoader__.load({
             if (!data || data.ok !== true) {
               if (data && (data.code === 'stale' || data.code === 'no-turn')) {
                 setStatus('idle')
-                emit({ visible: false })
+                beginLeave()
                 return
               }
               setStatus('error')
@@ -407,7 +496,7 @@ window.__ModuleLoader__.load({
             const key = sessionId + ':' + data.turn + ':' + data.endedAt
             if (!force && spoken.has(key)) {
               setStatus('idle')
-              emit({ visible: false })
+              beginLeave()
               return
             }
             spoken.add(key)
@@ -438,7 +527,7 @@ window.__ModuleLoader__.load({
             if (audio.current) audio.current.pause()
           } catch {}
           stopReveal()
-          emit({ visible: false })
+          beginLeave()
           setStatus('idle')
         }
         report({ event: 'toggle', sessionId: sessionId, enabled: next })
@@ -482,23 +571,29 @@ window.__ModuleLoader__.load({
     // ——— 浮层：鲸鱼娘立绘 + 对话气泡（按播放进度逐字显现） ———
     function VoiceAvatarCard() {
       const v = useView()
-      const L = textRef.current
+      const L = pickText()
       const [avatarOk, setAvatarOk] = React.useState(true)
       if (!v.visible) return null
 
       const full = String(v.text || '')
-      const total = Array.from(full).length
+      const chars = Array.from(full)
+      const total = chars.length
       const shownCount = v.phase === 'playing' ? Math.min(total, v.shown) : v.phase === 'loading' ? 0 : total
-      const shownText = Array.from(full).slice(0, Math.max(0, shownCount)).join('')
+      const pct = total ? Math.round((Math.max(0, shownCount) / total) * 100) : 0
 
       function close() {
         stopReveal()
         try {
           if (currentAudio) currentAudio.pause()
         } catch {}
-        clearTimeout(hideTimer)
-        emit({ visible: false, phase: 'idle', text: '', shown: 0 })
+        beginLeave()
       }
+
+      // 已显示的字逐个变成 span：新 mount 的那个会播一次 4px 上浮，老的字保持不动。
+      const spokenSpans = chars.slice(0, Math.max(0, shownCount)).map(function (ch, i) {
+        if (ch === '\n') return h('br', { key: 'c' + i })
+        return h('span', { key: 'c' + i, className: 'mv-c' }, ch === ' ' ? '\u00A0' : ch)
+      })
 
       return h(
         React.Fragment,
@@ -506,7 +601,14 @@ window.__ModuleLoader__.load({
         h('style', { key: 'css' }, CARD_CSS),
         h(
           'div',
-          { key: 'card', className: 'mv-card is-' + v.phase, role: 'status', 'aria-live': 'polite' },
+          {
+            key: 'card',
+            className: 'mv-card is-' + v.phase + (v.leaving ? ' is-leaving' : ''),
+            role: 'status',
+            'aria-live': 'polite',
+            'aria-label': v.phase === 'loading' || !full ? L.preparing : full,
+          },
+          h('div', { className: 'mv-glow', key: 'glow', 'aria-hidden': true }),
           avatarOk
             ? h(
                 'div',
@@ -532,13 +634,19 @@ window.__ModuleLoader__.load({
             ),
             h(
               'div',
-              { className: 'mv-text', key: 'text' },
+              { className: 'mv-text', key: 'text', 'aria-hidden': true },
               v.phase === 'loading'
-                ? h('span', { className: 'mv-dim' }, L.preparing)
-                : shownText,
+                ? h('span', { className: 'mv-dim', key: 'prep' }, L.preparing)
+                : spokenSpans,
               v.phase === 'playing' ? h('span', { className: 'mv-caret', key: 'caret' }) : null
             ),
-            h('div', { className: 'mv-meta', key: 'meta' }, v.phase === 'blocked' ? L.blockedMeta : L.cardMeta)
+            h('div', { className: 'mv-bar', key: 'bar', 'aria-hidden': true }, h('i', { key: 'fill', style: v.phase === 'loading' ? undefined : { width: pct + '%' } })),
+            h(
+              'div',
+              { className: 'mv-meta', key: 'meta' },
+              h('span', { className: 'mv-dot', key: 'dot' }),
+              v.phase === 'blocked' ? L.blockedMeta : L.cardMeta
+            )
           )
         )
       )
@@ -716,12 +824,23 @@ window.__ModuleLoader__.load({
       )
     }
 
-    const textRef = { current: TEXT.zh }
+    /** 宿主的 locale 服务；读不到就留 null，此时 pickText() 一律用中文（浏览器偏好只用于诊断）。 */
+    const localeRef = { current: null }
+
+    function readLocaleService(ctx) {
+      try {
+        if (ctx && typeof ctx.get === 'function') return ctx.get('locale') || null
+      } catch {}
+      try {
+        if (ctx && ctx.locale) return ctx.locale
+      } catch {}
+      return null
+    }
 
     return {
       inject: ['slots'],
       apply(ctx) {
-        textRef.current = resolveText(ctx)
+        localeRef.current = readLocaleService(ctx)
         const slots = ctx.get ? ctx.get('slots') : ctx.slots
         if (!slots || typeof slots.register !== 'function') return
 

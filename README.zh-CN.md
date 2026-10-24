@@ -183,7 +183,8 @@ curl -s -X POST http://127.0.0.1:<端口>/mimo-voice/say \
 ├── index.js            # 宿主半：会话事件折叠、HTTP 路由、MiMo TTS 调用
 ├── client.js           # 浏览器半：小喇叭、浮层立绘、逐字气泡、配置卡
 ├── cordis.patch.yml    # bundle 的 Loader patch（默认配置）
-├── voice-sample.mp3    # 内置参考音（18 秒）
+├── voice-sample.mp3    # 内置参考音（7.7 秒）
+├── voice-sample-playful.mp3 # 内置参考音·俏皮版（7.3 秒）
 ├── avatar.webp         # 可选，未随仓库发布
 ├── locale/{en,zh}.json # 插件管理页的标题与描述
 ├── icon.svg            # 插件图标

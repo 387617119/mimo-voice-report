@@ -95,7 +95,7 @@ tags: ''
 | `voiceSample` | `voice-sample.mp3` | 复刻采样，相对插件目录或绝对路径；mp3/wav、单声道、5–15 秒干净人声最好 |
 | `avatar` | `avatar.webp` | 浮层立绘（png/webp/jpeg/gif）；缺失或留空 = 只显示气泡 |
 | `style` | 空 | 语气指令，走 `role: user`，不会念出来；留空 = 完全照采样说（最像） |
-| `tags` | 空 | 音频风格标签，贴正文开头，如 `(温柔 俏皮)`；会盖掉一部分原始音色 |
+| `tags` | `(俏皮 稚嫩)` | 音频风格标签，贴正文开头（俏皮 + 少女感的可爱）；留空关闭，标签会盖掉一部分原始音色 |
 | `summarizer` | `model` | `model` = MiMo 对话模型改写；`extract` = 纯规则抽取（少一次调用，更快） |
 | `summaryModel` | `mimo-v2.6-flash` | 负责改写的对话模型 |
 | `summaryMaxChars` | `64` | 口播稿长度上限 |

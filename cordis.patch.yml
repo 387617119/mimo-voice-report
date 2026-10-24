@@ -23,7 +23,8 @@
 
         # Delivery instruction (role: user, never spoken). Empty = faithful to the sample.
         style: ''
-        tags: ''
+        # Audio style tag prepended to the text: playful + girlish-cute. Empty disables it.
+        tags: '(俏皮 稚嫩)'
 
         maxChars: 90
         staleMs: 25000

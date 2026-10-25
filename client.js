@@ -14,12 +14,27 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
     const LANG_KEY = 'dsh.mimoVoiceReport.lang'
-    const CLIENT_VERSION = '1.13.0'
+    const CLIENT_VERSION = '1.30.9'
     const spoken = new Set()
+
+    // ——— 播放音量：设置卡写、播放侧读（持久化真身在宿主 config.volume） ———
+    const volumeState = { value: 1 }
+    function setCurrentVolume(value) {
+      const n = Number(value)
+      volumeState.value = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1
+    }
+
+    // ——— 跳转插件配置页：宿主 pluginNavigation（dsh 0.2.1+）挂上后置 ready ———
+    const navState = { ready: false }
+    let openBundleNav = null
+    const navListeners = new Set()
+    function notifyNav() {
+      navListeners.forEach(function (fn) { fn() })
+    }
 
     // ——— 共享视图状态：按钮写、浮层读 ———
     const listeners = new Set()
-    const view = { visible: false, phase: 'idle', text: '', shown: 0, leaving: false, fallback: '' }
+    const view = { visible: false, phase: 'idle', text: '', shown: 0, leaving: false, fallback: '', noCaret: false, translation: '', transShown: 0 }
     let hideTimer = 0
     let revealRaf = 0
     let currentAudio = null
@@ -50,6 +65,23 @@ window.__ModuleLoader__.load({
       return view
     }
 
+    /** pluginNavigation 挂上后重渲染（齿轮按钮随宿主能力出现/消失）。 */
+    function useNavReady() {
+      const [, bump] = React.useState(0)
+      React.useEffect(function () {
+        const fn = function () {
+          bump(function (n) {
+            return n + 1
+          })
+        }
+        navListeners.add(fn)
+        return function () {
+          navListeners.delete(fn)
+        }
+      }, [])
+      return navState.ready
+    }
+
     function stopReveal() {
       if (revealRaf) {
         cancelAnimationFrame(revealRaf)
@@ -57,15 +89,15 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 先播 240ms 离场动画，再真正卸载浮层。 */
+    /** 先播完离场动画（最长 340ms：立绘 40ms 延迟 + 300ms），再真正卸载浮层。 */
     function beginLeave() {
       if (!view.visible || view.leaving) return
       emit({ leaving: true })
       clearTimeout(hideTimer)
       hideTimer = setTimeout(function () {
         stopReveal()
-        emit({ visible: false, phase: 'idle', text: '', shown: 0, leaving: false })
-      }, 250)
+        emit({ visible: false, phase: 'idle', text: '', shown: 0, leaving: false, noCaret: false, translation: '', transShown: 0 })
+      }, 360)
     }
 
     function hideCardSoon(ms) {
@@ -75,14 +107,18 @@ window.__ModuleLoader__.load({
 
     function showCard(patch) {
       clearTimeout(hideTimer)
-      emit(Object.assign({ visible: true, shown: 0, leaving: false, fallback: '' }, patch))
+      emit(Object.assign({ visible: true, shown: 0, leaving: false, fallback: '', noCaret: false, translation: '', transShown: 0 }, patch))
     }
 
-    /** 按音频播放进度推进逐字显现（timeupdate 只有 ~4Hz，这里用 rAF 平滑）。 */
-    function startReveal(el, text) {
+    /** 按音频播放进度推进逐字显现（timeupdate 只有 ~4Hz，这里用 rAF 平滑）。
+     *  原文与译文共用同一个进度比，所以两者是「同步逐字」出现的，不是原文播完译文才整段弹出。 */
+    function startReveal(el, text, translation) {
       stopReveal()
       const total = Array.from(text).length
+      const trans = Array.from(String(translation || ''))
+      const transTotal = trans.length
       let last = -1
+      let lastTrans = -1
       function tick() {
         if (!el || el.paused || el.ended) {
           revealRaf = 0
@@ -94,9 +130,11 @@ window.__ModuleLoader__.load({
         if (isFinite(duration) && duration > 0) ratio = Math.min(1, (time + 0.12) / duration)
         else ratio = Math.min(1, time / Math.max(1, total / 4.5))
         const shown = Math.max(0, Math.min(total, Math.floor(ratio * total)))
-        if (shown !== last) {
+        const transShown = Math.max(0, Math.min(transTotal, Math.floor(ratio * transTotal)))
+        if (shown !== last || transShown !== lastTrans) {
           last = shown
-          emit({ shown: shown })
+          lastTrans = transShown
+          emit({ shown: shown, transShown: transShown })
         }
         revealRaf = requestAnimationFrame(tick)
       }
@@ -116,8 +154,10 @@ window.__ModuleLoader__.load({
         cardMeta: '鲸鱼娘 · 语音汇报',
         blockedMeta: '浏览器拦了自动播放 · 点一下小喇叭',
         fallbackMeta: '语音暂不可用 · 已用提示音',
+        translateFailed: '语种翻译失败 · 本轮用中文播报',
         close: '关闭',
         avatarAlt: '鲸鱼娘',
+        settings: '打开语音设置（音色 / 音量 / Key）',
       },
       en: {
         titleOn: 'Voice report on: speaks when a task finishes',
@@ -131,8 +171,10 @@ window.__ModuleLoader__.load({
         cardMeta: 'Voice report',
         blockedMeta: 'Autoplay blocked · tap the speaker to retry',
         fallbackMeta: 'TTS unavailable · chime instead',
+        translateFailed: 'Translation failed · speaking Chinese this turn',
         close: 'Close',
         avatarAlt: 'Whale girl',
+        settings: 'Open voice settings (voice / volume / key)',
       },
     }
 
@@ -151,21 +193,38 @@ window.__ModuleLoader__.load({
     ].join('\n')
 
     const CARD_CSS = [
-      // 容器只管定位；入场动效放在立绘/气泡两个子元素上，气泡比立绘晚 90ms 弹出。
+      // 容器只管定位；动效放在立绘/气泡/光晕三个子元素上，各自错峰入场。
       '.mv-card{position:fixed;right:24px;bottom:112px;z-index:80;display:flex;align-items:flex-end;gap:12px;max-width:min(440px,calc(100vw - 48px));pointer-events:none}',
-      '.mv-figure,.mv-bubble{animation:mv-rise .38s cubic-bezier(.18,.89,.32,1.18) both}',
-      '.mv-bubble{animation-delay:.09s}',
-      '.mv-card.is-leaving .mv-figure,.mv-card.is-leaving .mv-bubble{animation:mv-sink .24s ease forwards}',
-      '@keyframes mv-rise{from{opacity:0;transform:translateY(16px) scale(.95)}to{opacity:1;transform:none}}',
-      '@keyframes mv-sink{from{opacity:1;transform:none}to{opacity:0;transform:translateY(10px) scale(.97)}}',
+      /* —— 入场：从右下角"生长"出来，而不是整体平移 ——
+         光晕先亮（0ms）→ 立绘跟进（60ms，带轻微过冲）→ 气泡最后弹出（150ms，
+         从立绘一侧展开：transform-origin 设在左下角，配 scaleX 起手，像"被说出来"）。
+         三段错峰 + 不同缓动，比原来的同时缩放更有层次。 */
+      '.mv-glow{animation:mv-glow-in .5s ease both}',
+      // 入场/退场放在外层包裹 .mv-figwrap；浮动放在裁剪框 .mv-figure 本身。
+      '.mv-figwrap{flex:0 0 auto;animation:mv-fig-in .52s cubic-bezier(.16,1.02,.3,1.12) 60ms both}',
+      '.mv-bubble{animation:mv-bubble-in .46s cubic-bezier(.16,1.06,.32,1.1) 150ms both;transform-origin:0% 100%}',
+      '@keyframes mv-glow-in{from{opacity:0;transform:scale(.7)}to{opacity:1;transform:none}}',
+      '@keyframes mv-fig-in{0%{opacity:0;transform:translate(14px,22px) scale(.82) rotate(-2.5deg)}70%{opacity:1}100%{opacity:1;transform:none}}',
+      '@keyframes mv-bubble-in{0%{opacity:0;transform:translate(-6px,10px) scale(.9)}60%{opacity:1;transform:translate(0,-2px) scale(1.008)}100%{opacity:1;transform:none}}',
+      /* —— 退场：反向收回，比入场快（0.3s），气泡先走、立绘后走 —— */
+      '.mv-card.is-leaving .mv-bubble{animation:mv-bubble-out .22s ease-in forwards}',
+      '.mv-card.is-leaving .mv-figwrap{animation:mv-fig-out .3s ease-in 40ms forwards}',
+      '.mv-card.is-leaving .mv-glow{animation:mv-glow-out .34s ease-in forwards}',
+      '@keyframes mv-bubble-out{to{opacity:0;transform:translate(-4px,6px) scale(.94)}}',
+      '@keyframes mv-fig-out{to{opacity:0;transform:translate(10px,16px) scale(.88) rotate(-1.5deg)}}',
+      '@keyframes mv-glow-out{to{opacity:0;transform:scale(.85)}}',
       // 品牌色光晕：垫在卡片后面，准备/播放时最亮，播完慢慢暗下去。
       '.mv-glow{position:absolute;right:-30px;bottom:-34px;width:230px;height:190px;border-radius:50%;background:var(--dsw-alias-brand-primary);opacity:0;filter:blur(46px);pointer-events:none;z-index:-1;transition:opacity .5s ease}',
       '.mv-card.is-loading .mv-glow,.mv-card.is-playing .mv-glow{opacity:.28}',
       '.mv-card.is-done .mv-glow{opacity:.10}',
-      // 立绘：圆角小卡 + 顶部高光 + 呼吸浮动（img 本身在窗口里轻轻上下）。
-      '.mv-figure{position:relative;width:118px;height:154px;flex:0 0 auto;border-radius:18px;overflow:hidden;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);box-shadow:0 16px 34px rgba(0,0,0,.32);pointer-events:auto;transition:border-color .3s ease}',
+      // 立绘：圆角小卡 + 顶部高光 + 呼吸浮动。
+      // 浮动的正确做法：位移加在「裁剪框」上，而不是图片上。
+      // 图片永远 100% 填满裁剪框（cover），框整体上下平移 —— 内容和框之间没有相对位移，
+      // 所以既不会露出一丝底色（黑边），也不会因为位移把人物头顶/脚裁掉。
+      // cover 每侧只裁 1.6px（原图人物上下各有 8px 白边），人物完整。
+      '.mv-figure{position:relative;width:118px;height:154px;flex:0 0 auto;border-radius:18px;overflow:hidden;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);box-shadow:0 16px 34px rgba(0,0,0,.32);pointer-events:auto;transition:border-color .3s ease;animation:mv-bob 3.8s ease-in-out infinite;will-change:transform}',
       '.mv-figure:before{content:"";position:absolute;inset:0;background:radial-gradient(130% 100% at 50% 0%,rgba(255,255,255,.16),transparent 55%);pointer-events:none;z-index:1}',
-      '.mv-figure img{width:100%;height:100%;object-fit:contain;object-position:50% 100%;display:block;animation:mv-bob 3.8s ease-in-out infinite}',
+      '.mv-figure img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:50% 50%;display:block}',
       '.mv-card.is-playing .mv-figure{border-color:var(--dsw-alias-brand-primary)}',
       '@keyframes mv-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}',
       // 气泡：毛玻璃、大圆角、靠尾巴一侧收小角。
@@ -177,6 +236,7 @@ window.__ModuleLoader__.load({
       '@keyframes mv-char{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}',
       '.mv-caret{display:inline-block;width:2.5px;height:1em;margin-left:2px;vertical-align:-2px;border-radius:2px;background:var(--dsw-alias-brand-primary);animation:mv-blink 1s steps(2,start) infinite}',
       '.mv-dim{color:var(--dsw-alias-label-secondary)}',
+      '.mv-trans{margin-top:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-l1);font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word}',
       // 进度线：准备时来回扫，播放时跟音频走，播完停在满格再淡出。
       '.mv-bar{position:relative;height:2px;margin:9px 2px 7px;border-radius:2px;background:var(--dsw-alias-border-l1);overflow:hidden;opacity:0;transition:opacity .3s ease}',
       '.mv-card.is-loading .mv-bar,.mv-card.is-playing .mv-bar{opacity:1}',
@@ -202,7 +262,7 @@ window.__ModuleLoader__.load({
       '@keyframes mv-shake{0%,100%{transform:none}25%{transform:translateX(-3px)}60%{transform:translateX(2px)}}',
       '@keyframes mv-blink{0%,100%{opacity:1}50%{opacity:0}}',
       // 动效敏感用户：全部换成纯淡入淡出，浮动/呼吸/抖动一律关掉。
-      '@media (prefers-reduced-motion: reduce){.mv-figure,.mv-bubble{animation:mv-fade .18s ease both}.mv-card.is-leaving .mv-figure,.mv-card.is-leaving .mv-bubble{animation:mv-fadeout .18s ease forwards}.mv-figure img,.mv-c,.mv-card.is-blocked,.mv-card.is-error,.mv-dot,.mv-card.is-loading .mv-bar>i,.mv-caret{animation:none}}',
+      '@media (prefers-reduced-motion: reduce){.mv-figwrap,.mv-bubble{animation:mv-fade .18s ease both}.mv-card.is-leaving .mv-figwrap,.mv-card.is-leaving .mv-bubble{animation:mv-fadeout .18s ease forwards}.mv-glow{animation:none}.mv-figure,.mv-figure img,.mv-c,.mv-card.is-blocked,.mv-card.is-error,.mv-dot,.mv-card.is-loading .mv-bar>i,.mv-caret{animation:none}}',
       '@keyframes mv-fade{from{opacity:0}to{opacity:1}}',
       '@keyframes mv-fadeout{from{opacity:1}to{opacity:0}}',
       '@media (max-width:720px){.mv-card{right:14px;bottom:96px;gap:8px}.mv-figure{width:92px;height:122px;border-radius:14px}.mv-bubble{max-width:calc(100vw - 150px);border-radius:16px;border-bottom-left-radius:7px;padding:10px 26px 9px 12px}.mv-text{font-size:13.5px}}',
@@ -313,6 +373,21 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** 齿轮图标：对话页直达插件设置页。 */
+    function SettingsIcon() {
+      return h(
+        'svg',
+        { viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
+        h('circle', { cx: 12, cy: 12, r: 3.1, stroke: 'currentColor', strokeWidth: 1.6 }),
+        h('path', {
+          d: 'M19.2 14.4a1.5 1.5 0 0 0 .3 1.65l.05.06a1.8 1.8 0 1 1-2.55 2.55l-.06-.05a1.5 1.5 0 0 0-1.65-.3 1.5 1.5 0 0 0-.9 1.37v.17a1.8 1.8 0 1 1-3.6 0v-.09a1.5 1.5 0 0 0-.98-1.37 1.5 1.5 0 0 0-1.65.3l-.06.05a1.8 1.8 0 1 1-2.55-2.55l.05-.06a1.5 1.5 0 0 0 .3-1.65 1.5 1.5 0 0 0-1.37-.9H3.6a1.8 1.8 0 1 1 0-3.6h.09a1.5 1.5 0 0 0 1.37-.98 1.5 1.5 0 0 0-.3-1.65l-.05-.06A1.8 1.8 0 1 1 7.26 4.3l.06.05a1.5 1.5 0 0 0 1.65.3h.07a1.5 1.5 0 0 0 .9-1.37V3.1a1.8 1.8 0 1 1 3.6 0v.09a1.5 1.5 0 0 0 .9 1.37 1.5 1.5 0 0 0 1.65-.3l.06-.05a1.8 1.8 0 1 1 2.55 2.55l-.05.06a1.5 1.5 0 0 0-.3 1.65v.07a1.5 1.5 0 0 0 1.37.9h.17a1.8 1.8 0 1 1 0 3.6h-.09a1.5 1.5 0 0 0-1.37.9Z',
+          stroke: 'currentColor',
+          strokeWidth: 1.2,
+          strokeLinejoin: 'round',
+        })
+      )
+    }
+
     /** 播放用的 <audio>：统一在这里创建，浮层的关闭按钮也能停掉它。 */
     function ensureAudio(ref) {
       if (ref.current) return ref.current
@@ -329,6 +404,7 @@ window.__ModuleLoader__.load({
       const useSession = props.useSession
       const running = typeof useSession === 'function' ? useSession(function (snapshot) { return Boolean(snapshot && snapshot.running) }) : false
       const L = pickText()
+      const navReady = useNavReady()
       const [enabled, setEnabled] = React.useState(readEnabled)
       const [status, setStatus] = React.useState('idle')
       const [detail, setDetail] = React.useState('')
@@ -343,6 +419,13 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         const loc = localeInfo()
         report({ event: 'mounted', v: CLIENT_VERSION, sessionId: sessionId, enabled: readEnabled(), hasAudio: typeof Audio !== 'undefined', lang: pickText() === TEXT.en ? 'en' : 'zh', dshLocale: loc.tag, localeFrom: loc.from, browserLocale: loc.browser })
+        // 播放音量从宿主配置来（设置卡保存后写回，页面刷新/重开在这里重新同步）。
+        fetch('/mimo-voice/config')
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            if (data && Number.isFinite(Number(data.volume))) setCurrentVolume(data.volume)
+          })
+          .catch(function () {})
         const heartbeat = setInterval(function () {
           if (typeof document !== 'undefined' && document.hidden) return
           report({ event: 'heartbeat', v: CLIENT_VERSION, sessionId: sessionId, status: statusRef.current })
@@ -421,20 +504,35 @@ window.__ModuleLoader__.load({
             return
           }
           const text = String(data.text || '')
+          // 兜底提示音不到一秒，逐字显现没有意义：直接整句亮出、不挂闪烁光标。
+          const isFallback = data.fallback === true
+          // 译文（语种 ≠ zh 时宿主在 displayText 里追加）：与原文同步逐字显现。
+          const display = String(data.displayText || '')
+          const translation = display && display !== text ? display.slice(text.length).replace(/^\s*\n\s*/, '').trim() : ''
+          const transTotal = Array.from(translation).length
           const el = ensureAudio(audio)
+          el.volume = volumeState.value
           let started = false
           el.onplaying = function () {
             if (started) return
             started = true
             if (!alive.current) return
             // 被自动播放拦下后靠用户手势补播时，浮层可能已在离场路上，这里重新亮出来。
-            showCard({ phase: 'playing', text: text, shown: 0 })
-            startReveal(el, text)
+            showCard({
+              phase: 'playing',
+              text: text,
+              shown: isFallback ? Array.from(text).length : 0,
+              noCaret: isFallback,
+              translation: translation,
+              // 兜底「叮」时没有播放进度可跟，原文/译文直接全显。
+              transShown: isFallback ? transTotal : 0,
+            })
+            if (!isFallback) startReveal(el, text, translation)
             report({ event: 'card-playing', sessionId: sessionId, chars: Array.from(text).length, duration: Math.round((el.duration || 0) * 100) / 100 })
           }
           el.onended = function () {
             stopReveal()
-            emit({ phase: 'done', shown: Array.from(text).length })
+            emit({ phase: 'done', shown: Array.from(text).length, transShown: transTotal })
             hideCardSoon(2800)
             if (alive.current) setStatus('idle')
             report({ event: 'card-done', sessionId: sessionId, chars: Array.from(text).length })
@@ -477,10 +575,14 @@ window.__ModuleLoader__.load({
         if (!sessionId) return Promise.resolve()
         setStatus('loading')
         showCard({ phase: 'loading', text: '', shown: 0 })
+        // 宿主最坏要等 摘要 + TTS（各带一次重试）两段超时；给请求一个总上限，别让按钮无限转圈。
+        const signal =
+          typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(100000) : undefined
         return fetch('/mimo-voice/report', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId: sessionId, force: force === true }),
+          signal: signal,
         })
           .then(function (response) { return response.json() })
           .then(function (data) {
@@ -507,23 +609,35 @@ window.__ModuleLoader__.load({
             spoken.add(key)
             // MiMo 不可用时宿主会返回内置提示音（fallback:true）：照播，但气泡要说明原因。
             const isFallback = data.fallback === true
-            setDetail((isFallback ? String(data.message || '') + ' · ' : '') + String(data.text || ''))
+            // 语种翻译失败时宿主回落中文播报，并带回 translateError——必须让用户看见原因。
+            if (data.translateError) report({ event: 'translate-failed', sessionId: sessionId, reason: data.translateError })
+            const metaNote = isFallback
+              ? String(data.message || L.fallbackMeta)
+              : data.translateError
+                ? L.translateFailed
+                : ''
+            setDetail((metaNote ? metaNote + ' · ' : '') + String(data.displayText || data.text || ''))
             showCard({
               phase: 'loading',
               text: String(data.text || ''),
               shown: 0,
-              fallback: isFallback ? String(data.message || L.fallbackMeta) : '',
+              fallback: metaNote,
+              translation: String(data.displayText || '') !== String(data.text || '')
+                ? String(data.displayText).slice(String(data.text || '').length).replace(/^\s*\n\s*/, '').trim()
+                : '',
             })
             if (isFallback) report({ event: 'report-fallback', sessionId: sessionId, kind: data.kind, message: data.message })
             return play(data)
           })
           .catch(function (error) {
             if (!alive.current) return
+            const timedOut = error && (error.name === 'TimeoutError' || error.name === 'AbortError')
+            const why = timedOut ? '等太久了，这次先放弃（宿主可能仍在处理，稍后点小喇叭重试）' : String((error && error.message) || error)
             setStatus('error')
-            setDetail(String((error && error.message) || error))
-            emit({ phase: 'error', text: String((error && error.message) || '语音汇报失败') })
+            setDetail(why)
+            emit({ phase: 'error', text: why })
             hideCardSoon(4500)
-            report({ event: 'report-error', sessionId: sessionId, message: String((error && error.message) || error) })
+            report({ event: 'report-error', sessionId: sessionId, message: why })
           })
       }
 
@@ -577,7 +691,23 @@ window.__ModuleLoader__.load({
             onClick: onClick,
           },
           h(SpeakerIcon, { muted: !enabled })
-        )
+        ),
+        navReady
+          ? h(
+              'button',
+              {
+                key: 'settings',
+                type: 'button',
+                className: 'mv-report',
+                title: L.settings,
+                'aria-label': L.settings,
+                onClick: function () {
+                  if (openBundleNav) openBundleNav('mimo-voice-report')
+                },
+              },
+              h(SettingsIcon)
+            )
+          : null
       )
     }
 
@@ -608,6 +738,12 @@ window.__ModuleLoader__.load({
         return h('span', { key: 'c' + i, className: 'mv-c' }, ch === ' ' ? '\u00A0' : ch)
       })
 
+      // 译文与原文共用播放进度：playing 时按 transShown 逐字，done/error 时整段补齐。
+      const transChars = Array.from(v.translation || '')
+      const transCount =
+        v.phase === 'done' || v.phase === 'error' ? transChars.length : Math.max(0, Math.min(transChars.length, v.transShown || 0))
+      const transText = transChars.slice(0, transCount).join('')
+
       return h(
         React.Fragment,
         null,
@@ -625,16 +761,20 @@ window.__ModuleLoader__.load({
           avatarOk
             ? h(
                 'div',
-                { className: 'mv-figure', key: 'figure' },
-                h('img', {
-                  src: '/mimo-voice/avatar',
-                  alt: L.avatarAlt,
-                  draggable: false,
-                  onError: function () {
-                    setAvatarOk(false)
-                    report({ event: 'avatar-failed' })
-                  },
-                })
+                { className: 'mv-figwrap', key: 'figure' },
+                h(
+                  'div',
+                  { className: 'mv-figure' },
+                  h('img', {
+                    src: '/mimo-voice/avatar',
+                    alt: L.avatarAlt,
+                    draggable: false,
+                    onError: function () {
+                      setAvatarOk(false)
+                      report({ event: 'avatar-failed' })
+                    },
+                  })
+                )
               )
             : null,
           h(
@@ -651,8 +791,13 @@ window.__ModuleLoader__.load({
               v.phase === 'loading'
                 ? h('span', { className: 'mv-dim', key: 'prep' }, L.preparing)
                 : spokenSpans,
-              v.phase === 'playing' ? h('span', { className: 'mv-caret', key: 'caret' }) : null
+              v.phase === 'playing' && !v.noCaret ? h('span', { className: 'mv-caret', key: 'caret' }) : null
             ),
+            // 译文（语种 ≠ zh 时）：与原文共用同一个播放进度比，同步逐字显现；
+            // 播完 / 出错时整段补齐（transCount 已按阶段算好）。
+            transText
+              ? h('div', { className: 'mv-trans', key: 'trans' }, transText)
+              : null,
             h('div', { className: 'mv-bar', key: 'bar', 'aria-hidden': true }, h('i', { key: 'fill', style: v.phase === 'loading' ? undefined : { width: pct + '%' } })),
             h(
               'div',
@@ -678,6 +823,7 @@ window.__ModuleLoader__.load({
       '.mv-key-warn{font-size:12px;color:var(--dsw-alias-state-warn-primary)}',
       '.mv-key-ok{font-size:12px;color:var(--dsw-alias-state-success-primary)}',
       '.mv-key-select{height:30px;padding:0 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;outline:none}',
+      '.mv-key-range{flex:1 1 auto;min-width:0;height:30px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}',
       '.mv-key-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
       '.mv-key-textarea{width:100%;min-height:66px;max-height:150px;padding:7px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.6;outline:none;resize:vertical;box-sizing:border-box}',
       '.mv-key-textarea:focus{border-color:var(--dsw-alias-brand-primary)}',
@@ -697,7 +843,7 @@ window.__ModuleLoader__.load({
       const [nick, setNick] = React.useState('')
       // 宿主半 < 1.10.0 不认识 callMe：能读旧 /config 但存不进称呼，这里直接禁用并提示重启。
       const [hostOld, setHostOld] = React.useState(false)
-      // /config 的能力标记：3 = 结束语库按 完成/出错/中止 三桶分别配置。
+      // /config 的能力标记：3 = 结束语库按 完成/出错/中止 三桶分别配；4 = 每音色人设提示词。
       const [hostApi, setHostApi] = React.useState(0)
       const [drafts, setDrafts] = React.useState({ completed: '', error: '', aborted: '' })
       const [counts, setCounts] = React.useState({ completed: 0, error: 0, aborted: 0 })
@@ -706,6 +852,23 @@ window.__ModuleLoader__.load({
       const [value, setValue] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState('')
+      const [previewing, setPreviewing] = React.useState(false)
+      const [customText, setCustomText] = React.useState('')
+      const [volume, setVolumeState] = React.useState(1)
+      const [personaId, setPersonaId] = React.useState('original')
+      const [personaText, setPersonaText] = React.useState('')
+      const [personaCustom, setPersonaCustom] = React.useState(false)
+      const [language, setLanguageState] = React.useState('zh')
+      const [languages, setLanguages] = React.useState({ zh: '中文（不翻译）', en: 'English', ja: '日本語', ko: '한국어' })
+      const [speechRate, setSpeechRate] = React.useState(1)
+      const previewAudio = React.useRef(null)
+
+      function applyPersonaPrompt(p) {
+        if (!p || typeof p !== 'object') return
+        setPersonaId(String(p.id || 'original'))
+        setPersonaText(String(p.text || ''))
+        setPersonaCustom(Boolean(p.custom))
+      }
 
       function applyPersona(p) {
         const lib = p && typeof p === 'object' ? p.customAnnounces : null
@@ -733,11 +896,21 @@ window.__ModuleLoader__.load({
             setState({ loading: false, keySource: String(data.keySource || ''), keyHint: String(data.keyHint || '') })
             const v = (data && data.voice) || {}
             setVoice({ sample: String(v.sample || ''), presets: Array.isArray(v.presets) ? v.presets : [] })
+            const vol = Number(data && data.volume)
+            if (Number.isFinite(vol)) {
+              const clamped = Math.min(1, Math.max(0, vol))
+              setVolumeState(clamped)
+              setCurrentVolume(clamped)
+            }
+            if (data && data.language) setLanguageState(String(data.language))
+            if (data && data.languages && typeof data.languages === 'object') setLanguages(data.languages)
+            if (data && data.speechRate && Number.isFinite(Number(data.speechRate.factor))) setSpeechRate(Number(data.speechRate.factor))
             const p = (data && data.persona) || {}
             setCallMe(String(p.callMe || ''))
             setHostOld(!data || !data.persona)
             setHostApi(Number(data && data.api) || 0)
             applyPersona(p)
+            applyPersonaPrompt(data && data.personaPrompt)
           })
           .catch(function (error) {
             setState({ loading: false, keySource: 'error', keyHint: '' })
@@ -746,6 +919,14 @@ window.__ModuleLoader__.load({
       }
 
       React.useEffect(load, [])
+
+      React.useEffect(function () {
+        return function () {
+          try {
+            if (previewAudio.current) previewAudio.current.pause()
+          } catch {}
+        }
+      }, [])
 
       function pickVoice(file) {
         if (!file) return
@@ -765,7 +946,206 @@ window.__ModuleLoader__.load({
             }
             const v = (data && data.voice) || {}
             setVoice({ sample: String(v.sample || file), presets: Array.isArray(v.presets) ? v.presets : [] })
+            // 切音色 = 换人设：新音色的生效提示词回填编辑框。
+            applyPersonaPrompt(data && data.personaPrompt)
             setNote('音色已切换并生效')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+      /** 默认播放当前音色随包发布的人设台词 MP3：本地秒播、不产生 MiMo 调用。 */
+      function previewVoice() {
+        const file = voice.sample
+        if (!file || previewing) return
+        if (typeof Audio === 'undefined') {
+          setNote('当前浏览器不支持音频播放')
+          return
+        }
+        setPreviewing(true)
+        setNote('')
+        try {
+          if (previewAudio.current) previewAudio.current.pause()
+        } catch {}
+        const el = new Audio('/mimo-voice/preview?voice=' + encodeURIComponent(file))
+        el.volume = volumeState.value
+        previewAudio.current = el
+        let settled = false
+        el.onplaying = function () {
+          settled = true
+          setPreviewing(false)
+          setNote('正在试听')
+        }
+        el.onerror = function () {
+          setPreviewing(false)
+          setNote('这条音色没有固定试听，请在下方输入台词后点「生成试听」。')
+        }
+        const playing = el.play()
+        if (playing && typeof playing.then === 'function') {
+          playing.catch(function () {
+            setPreviewing(false)
+            if (el.error) setNote('这条音色没有固定试听，请在下方输入台词后点「生成试听」。')
+            else setNote('浏览器拦了自动播放；点一下页面任意处后再试')
+          })
+        }
+        setTimeout(function () {
+          if (!settled && previewAudio.current === el) setPreviewing(false)
+        }, 5000)
+      }
+
+      /** 可选：用当前音色实时念用户输入的台词（走宿主 /say，限 6 次/分钟）。 */
+      function previewCustom() {
+        const text = customText.trim().slice(0, 120)
+        if (!text || previewing) return
+        setPreviewing(true)
+        setNote('')
+        fetch('/mimo-voice/say', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setPreviewing(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '试听失败'))
+              return
+            }
+            if (typeof Audio === 'undefined') {
+              setNote('当前浏览器不支持音频播放')
+              return
+            }
+            try {
+              if (previewAudio.current) previewAudio.current.pause()
+            } catch {}
+            const el = new Audio('data:' + (data.mime || 'audio/mpeg') + ';base64,' + data.audio)
+            el.volume = volumeState.value
+            previewAudio.current = el
+            const playing = el.play()
+            if (playing && typeof playing.catch === 'function') {
+              playing.catch(function () { setNote('浏览器拦了自动播放；点一下页面任意处后再试') })
+            }
+            setNote('正在试听')
+          })
+          .catch(function (error) {
+            setPreviewing(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+      /** 语速倍率：null = 清除自定义、回落按语种默认。 */
+      function saveSpeechRate(next) {
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ speechRateFactor: next === null ? null : next }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '保存失败'))
+              return
+            }
+            if (data.speechRate && Number.isFinite(Number(data.speechRate.factor))) setSpeechRate(Number(data.speechRate.factor))
+            setNote('语速已保存并生效')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+
+      /** 汇报语种：非中文时字幕/悬停文字在中文后追加译文（语音仍播中文）。 */
+      function saveLanguage(next) {
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ language: next }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '保存失败'))
+              return
+            }
+            setLanguageState(String(data.language || next))
+            // 切语种后宿主会自动清掉自定义倍率，这里同步滑杆到新语种的默认倍率。
+            if (data.speechRate && Number.isFinite(Number(data.speechRate.factor))) setSpeechRate(Number(data.speechRate.factor))
+            // 音色列表要按语种重算：方言音色只在中文语种下提供。
+            const v2 = (data && data.voice) || {}
+            if (Array.isArray(v2.presets) && v2.presets.length) {
+              setVoice({ sample: String(v2.sample || voice.sample), presets: v2.presets })
+            }
+            // 若当前音色是方言而语种切到了非中文，回落到原版音色（方言项已隐藏）。
+            const stillDialect = String(v2.sample || '').indexOf('dialect-') >= 0
+            const targetLang = String(data.language || next)
+            if (stillDialect && targetLang !== 'zh') {
+              pickVoice('voice-sample.mp3')
+            }
+            setNote('语种已保存并生效')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+      /** 人设提示词：保存为当前音色的自定义；text 传空串 = 恢复该音色的内置默认。 */
+      function savePersona(text) {
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ personaPrompt: { id: personaId, text: text } }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '保存失败'))
+              return
+            }
+            applyPersonaPrompt(data && data.personaPrompt)
+            setNote(text ? '人设已保存并生效' : '已恢复默认人设')
+          })
+          .catch(function (error) {
+            setBusy(false)
+            setNote(String((error && error.message) || error))
+          })
+      }
+
+      /** 音量：拖动即时生效（下次播放就按这个音量），「保存」写回 config.volume 持久化。 */
+      function saveVolume(next) {
+        setBusy(true)
+        setNote('')
+        fetch('/mimo-voice/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ volume: next }),
+        })
+          .then(function (response) { return response.json() })
+          .then(function (data) {
+            setBusy(false)
+            if (!data || data.ok !== true) {
+              setNote(String((data && data.message) || '保存失败'))
+              return
+            }
+            const vol = Number(data && data.volume)
+            if (Number.isFinite(vol)) {
+              setVolumeState(vol)
+              setCurrentVolume(vol)
+            }
+            setNote('音量已保存并生效')
           })
           .catch(function (error) {
             setBusy(false)
@@ -896,14 +1276,162 @@ window.__ModuleLoader__.load({
                   })
                 : h('option', { key: 'none', value: '' }, state.loading ? '读取中…' : '没有可用采样')
             ),
+            h(
+              'button',
+              { key: 'vprev', type: 'button', disabled: busy || previewing || !voice.sample, onClick: previewVoice },
+              previewing ? '播放中…' : '试听'
+            ),
             note === '音色已切换并生效'
               ? h('span', { key: 'vok', className: 'mv-key-ok' }, '已切换')
               : null
           ),
           h(
             'div',
+            { className: 'mv-key-row', key: 'vcustom' },
+            h('input', {
+              key: 'vcustomtext',
+              type: 'text',
+              autoComplete: 'off',
+              spellCheck: false,
+              maxLength: 120,
+              placeholder: '想听别的台词？在这里输入（最多 120 字）',
+              value: customText,
+              disabled: busy || previewing,
+              onChange: function (event) { setCustomText(event.target.value) },
+              onKeyDown: function (event) {
+                if (event.key === 'Enter') previewCustom()
+              },
+            }),
+            h('button', {
+              key: 'vcustomgo',
+              type: 'button',
+              disabled: busy || previewing || !customText.trim(),
+              onClick: previewCustom,
+            }, '生成试听')
+          ),
+          h(
+            'div',
             { className: 'mv-key-note', key: 'vnote' },
-            '切换后立即生效（写回本插件 config.voiceSample）。想加新音色：把 5–15 秒的 mp3/wav 丢进插件目录即可出现在这里。'
+            '默认播放这条音色的固定人设台词 MP3，本地秒播、不花 MiMo 额度；「生成试听」才实时合成（限 6 次/分钟）。自定义采样：把 5–15 秒的 voice-sample-名字.mp3 丢进插件目录即可。'
+          ),
+          h('div', { className: 'mv-key-title', key: 'ppt' }, '人设提示词'),
+          h('textarea', {
+            key: 'ppta',
+            className: 'mv-key-textarea',
+            rows: 3,
+            maxLength: 200,
+            spellCheck: false,
+            placeholder: state.loading ? '读取中…' : '这个音色是什么角色、怎么说话（只写人设句，最长 200 字）',
+            value: personaText,
+            disabled: busy || hostApi < 4,
+            onChange: function (event) { setPersonaText(event.target.value) },
+          }),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'pprow' },
+            h('button', { key: 'ppsave', type: 'button', className: 'primary', disabled: busy || hostApi < 4 || !personaId || !personaText.trim(), onClick: function () { savePersona(personaText.trim()) } }, '保存'),
+            personaCustom && hostApi >= 4
+              ? h('button', { key: 'ppreset', type: 'button', disabled: busy, onClick: function () { savePersona('') } }, '恢复默认')
+              : null,
+            note === '人设已保存并生效' || note === '已恢复默认人设'
+              ? h('span', { key: 'ppok', className: 'mv-key-ok' }, '已生效')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'ppnote' },
+            hostApi < 4
+              ? '宿主半还是旧版本（重启 DSH 后这里才能编辑人设）。'
+              : h(React.Fragment, { key: 'ppn' }, '当前音色「', personaId || 'original', '」', personaCustom ? '用的是你的自定义人设' : '用的是内置默认人设',
+                 '。汇报口播稿会按这个人设的口吻生成（走摘要模型时生效；紧急兜底的抽取式摘要不经过人设）。切到别的音色时这里会跟着切换。')
+          ),
+          h('div', { className: 'mv-key-title', key: 'volt' }, '音量'),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'volrow' },
+            h('input', {
+              key: 'volrange',
+              type: 'range',
+              min: 0,
+              max: 1,
+              step: 0.05,
+              className: 'mv-key-range',
+              value: volume,
+              disabled: busy,
+              onChange: function (event) {
+                const v = Number(event.target.value)
+                setVolumeState(v)
+                setCurrentVolume(v)
+              },
+            }),
+            h('span', { key: 'volpct', className: 'mv-key-note' }, Math.round(volume * 100) + '%'),
+            h('button', { key: 'volsave', type: 'button', className: 'primary', disabled: busy, onClick: function () { saveVolume(volume) } }, '保存'),
+            note === '音量已保存并生效'
+              ? h('span', { key: 'volok', className: 'mv-key-ok' }, '已生效')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'volnote' },
+            '拖动即时生效（下一次播放就按这个音量）；「保存」写回 config.volume 持久化，范围 0–100%，默认 100%。'
+          ),
+          h('div', { className: 'mv-key-title', key: 'lt2' }, '汇报语种'),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'lrow2' },
+            h(
+              'select',
+              {
+                key: 'langsel',
+                className: 'mv-key-select',
+                value: language,
+                disabled: busy || hostApi < 4,
+                onChange: function (event) { saveLanguage(event.target.value) },
+              },
+              Object.keys(languages).map(function (code) {
+                return h('option', { key: code, value: code }, languages[code])
+              })
+            ),
+            note === '语种已保存并生效'
+              ? h('span', { key: 'lok2', className: 'mv-key-ok' }, '已生效')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'lnote2' },
+            hostApi < 4
+              ? '宿主半还是旧版本（重启 DSH 后这里才能选语种）。'
+              : '选择其他语种后，语音汇报会切换成该语种（中文稿由 MiMo 整段翻译，保留人设口吻）；气泡字幕随语音显示该语种原文，播完后追加中文译文。翻译失败时本轮回落中文播报。方言音色只在中文语种下出现在上面的音色列表里。'
+          ),
+          h('div', { className: 'mv-key-title', key: 'srt' }, '语速'),
+          h('div', { className: 'mv-key-title', key: 'srt' }, '语速'),
+          h(
+            'div',
+            { className: 'mv-key-row', key: 'srrow' },
+            h('input', {
+              key: 'srrange',
+              type: 'range',
+              min: 0.7,
+              max: 1.5,
+              step: 0.02,
+              className: 'mv-key-range',
+              value: speechRate,
+              disabled: busy || hostApi < 4,
+              onChange: function (event) { setSpeechRate(Number(event.target.value)) },
+            }),
+            h('span', { key: 'srpct', className: 'mv-key-note' }, speechRate.toFixed(2) + '×'),
+            h('button', { key: 'srsave', type: 'button', className: 'primary', disabled: busy || hostApi < 4, onClick: function () { saveSpeechRate(speechRate) } }, '保存'),
+            h('button', { key: 'srreset', type: 'button', disabled: busy || hostApi < 4, onClick: function () { saveSpeechRate(null) } }, '按语种默认'),
+            note === '语速已保存并生效'
+              ? h('span', { key: 'srok', className: 'mv-key-ok' }, '已生效')
+              : null
+          ),
+          h(
+            'div',
+            { className: 'mv-key-note', key: 'srnote' },
+            hostApi < 4
+              ? '宿主半还是旧版本（重启 DSH 后这里才能调语速）。'
+              : '合成后用 ffmpeg 变速不变调（确定可控）。默认：中文 1.00× / 英语 1.08× / 日语 1.12× / 韩语 1.10×；**切换语种会自动套用该语种默认值**（想固定就用这里的滑杆覆盖）。'
           ),
           h('div', { className: 'mv-key-title', key: 'ct' }, '称呼'),
           h(
@@ -1008,7 +1536,7 @@ window.__ModuleLoader__.load({
             { className: 'mv-key-note', key: 'note' },
             '当前来源：', source, hint, '。留空时按 config.apiKey → 环境变量 MIMO_API_KEY → ~/.dsh/.credentials.yaml 的顺序取用；Key 只在宿主进程使用，不会下发到浏览器。'
           ),
-          note && note !== '音色已切换并生效' && note !== '称呼已保存并生效' && note !== '结束语库已保存并生效' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
+          note && note !== '音色已切换并生效' && note !== '称呼已保存并生效' && note !== '结束语库已保存并生效' && note !== '音量已保存并生效' && note !== '人设已保存并生效' && note !== '已恢复默认人设' && note !== '语种已保存并生效' && note !== '方言已保存并生效' && note !== '语速已保存并生效' && note !== '正在试听' ? h('div', { className: 'mv-key-warn', key: 'msg' }, note) : null
         )
       )
     }
@@ -1032,6 +1560,24 @@ window.__ModuleLoader__.load({
         localeRef.current = readLocaleService(ctx)
         const slots = ctx.get ? ctx.get('slots') : ctx.slots
         if (!slots || typeof slots.register !== 'function') return
+
+        // 对话页齿轮按钮的跳转通道：宿主 pluginNavigation（dsh 0.2.1+）可用才显示。
+        try {
+          if (typeof ctx.inject === 'function') {
+            ctx.inject(['pluginNavigation'], function (scoped) {
+              const nav = scoped && scoped.pluginNavigation
+              if (nav && typeof nav.openBundle === 'function') {
+                openBundleNav = function (name) {
+                  try {
+                    nav.openBundle(name)
+                  } catch {}
+                }
+                navState.ready = true
+                notifyNav()
+              }
+            })
+          }
+        } catch {}
 
         const registerButton = function () {
           return slots.register(

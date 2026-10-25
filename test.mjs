@@ -3,7 +3,7 @@
  * 覆盖：文本清理、摘要截断、结束语库、错误分类（含原始状态码）、Key 掩码、熔断状态机。
  */
 import assert from 'node:assert/strict'
-import { existsSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, unlinkSync, writeFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -444,6 +444,46 @@ await test('effectiveTtsModel：中文克隆、外语/方言自动预置', () =>
     'mimo-v2.5-tts',
     '方言音色强制预置',
   )
+})
+
+// ——— 客户端结构测试（正则断言，防止重构时意外丢失关键逻辑） ———
+import { readFileSync as readClient } from 'node:fs'
+const clientSrc = readClient(new URL('./client.js', import.meta.url), 'utf8')
+
+await test('客户端：startReveal 同步驱动原文+译文', () => {
+  assert.ok(/function startReveal\(el, text, translation\)/.test(clientSrc), '签名应含 translation 参数')
+  assert.ok(/emit\(\{ shown: shown, transShown: transShown \}\)/.test(clientSrc), '应同时发射 shown + transShown')
+})
+
+await test('客户端：自适应隐藏时间', () => {
+  assert.ok(/Math\.min\(9000, 2800 \+ totalChars \* 60\)/.test(clientSrc), 'hideCardSoon 应按字数自适应')
+})
+
+await test('客户端：avatar 缓存击穿', () => {
+  assert.ok(/avatarVersion \? '\?v=' \+ avatarVersion/.test(clientSrc), 'img src 应带 ?v= 版本参数')
+})
+
+await test('客户端：ja/ko UI 文案', () => {
+  assert.ok(/ja:\s*\{/.test(clientSrc), '应有日语 TEXT 字典')
+  assert.ok(/ko:\s*\{/.test(clientSrc), '应有韩语 TEXT 字典')
+  assert.ok(/TEXT\[forced\]/.test(clientSrc), 'pickText 应按 locale 索引')
+})
+
+await test('客户端：aria-label 含译文', () => {
+  assert.ok(/v\.translation/.test(clientSrc) && /aria-label/.test(clientSrc), 'aria-label 应拼接 translation')
+})
+
+await test('客户端：切语种记住克隆音色', () => {
+  assert.ok(/lastCloneSample/.test(clientSrc), '应在 localStorage 记住上次克隆音色')
+})
+
+await test('方言试听文件存在', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  for (const code of ['yue', 'sc', 'ne', 'ha', 'sd', 'tw']) {
+    const f = join(here, `preview-dialect-${code}.mp3`)
+    assert.ok(existsSync(f), `缺方言试听: preview-dialect-${code}.mp3`)
+    assert.ok(statSync(f).size > 10000, `方言试听太小: ${code}`)
+  }
 })
 
 console.log('')

@@ -1,6 +1,6 @@
 {
   "name": "mimo-voice-report",
-  "version": "1.30.9",
+  "version": "1.31.0",
   "private": false,
   "type": "module",
   "scripts": {
@@ -50,6 +50,7 @@
     "icon.svg",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {

@@ -160,6 +160,10 @@ const DEFAULTS = {
   summaryMaxChars: 64,
   /** 汇报语种：zh = 中文；其他语种把整段汇报翻译过去——语音说该语种，字幕原文后附中文译文。 */
   language: 'zh',
+  /** 非中文语种的 TTS 请求超时下限（毫秒）。外语合成偶发很慢，30s 会误伤。 */
+  otherLanguageTimeoutMs: 60000,
+  /** 长音频保护阈值（秒）：估算时长超过它就再合成一次取更短的（MiMo 偶发拖长）。 */
+  longAudioSeconds: 22,
   /** 自定义语速指令（自然语言）。留空 = 按语种自动补偿（日语/韩语/英语会提速）。 */
   speechRate: '',
   /** 方言口音（MiMo-TTS 风格指令通道）：空 = 普通话；可选 粤语/四川话/东北话/河南话/台湾腔。 */
@@ -291,7 +295,7 @@ export function speechRateStyle(cfg = {}) {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.30.9'
+const VERSION = '1.31.0'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -461,6 +465,8 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
         },
         voice: { sample: cfg.voiceSample || '', presets: voicePresets(cfg) },
         personaPrompt: personaPromptFor(cfg),
+        avatarVersion: avatarInfo(cfg).mtime || 0,
+        runtime: { ffmpeg: await probeFfmpeg(cfg) },
         persona: {
           callMe: String(cfg.callMe || '').trim(),
           customAnnounces: normalizeCustomLibrary(cfg.customAnnounces),
@@ -734,11 +740,10 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
   if (url.pathname === '/mimo-voice/preview') {
     if (method !== 'GET') return json(res, 405, { ok: false, code: 'method-not-allowed' })
     const sample = String(url.searchParams.get('voice') || '')
-    // 方言音色没有实体采样文件（走预置音色发音），它的"试听"必须实时合成。
-    if (dialectOfSample(sample)) {
-      return json(res, 404, { ok: false, code: 'no-preview', message: '方言音色需要实时合成，点「生成试听」即可听到效果。' })
+    // 方言音色也带固定试听（预置音色 + 方言标签合成）；缺文件时仍回落实时合成。
+    if (!dialectOfSample(sample) && !isKnownSample(sample)) {
+      return json(res, 400, { ok: false, code: 'bad-voice', message: '只能试听插件目录里已存在的采样。' })
     }
-    if (!isKnownSample(sample)) return json(res, 400, { ok: false, code: 'bad-voice', message: '只能试听插件目录里已存在的采样。' })
     const preview = previewFileFor(sample)
     if (!preview) return json(res, 404, { ok: false, code: 'no-preview', message: '这条音色没有固定试听，可输入台词实时生成。' })
     try {
@@ -828,23 +833,31 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
  * 所有失败都折进载荷返回（兜底提示音或 ok:false），不会 reject。
  */
 async function produceReport({ sessionId, rec, force, cfg, cache, host, turnKey }) {
-  // 中文稿照常生成（人设驱动）；语种 ≠ zh 时整段翻译成目标语种：
-  // 语音与字幕原文说目标语种（spoken），中文原稿降级为字幕播完后追加的译文。
-  // 翻译失败则整体回落中文播报，不影响本体的可用性。
-  const chineseText = await buildReportText(rec, cfg)
   const lang = normalizeLanguage(cfg.language)
-  let text = chineseText
-  let displayText = chineseText
-  let translateError = ''
-  if (lang !== 'zh' && chineseText) {
-    const result = await translateReportDetailed(chineseText, cfg, lang)
-    if (result.text) {
-      text = result.text
-      displayText = `${result.text}\n${chineseText}`
-    } else {
-      translateError = result.error || 'unknown'
-      pushEvent(host, 'translate-skipped', { lang, reason: translateError, turn: rec.turn })
-      host.lastError = { at: Date.now(), kind: 'translate', message: `翻译成 ${lang} 失败（${translateError}），本轮改播中文` }
+  let text, displayText, translateError = ''
+
+  // 优先走合并双语生成（一次调用同时产出目标语种 + 中文对照，省一半延迟）。
+  // 仅 completed + 非中文 + model summarizer 时可用；失败则回落到两步法。
+  const bilingual = await generateBilingualReport(rec, cfg, lang)
+  if (bilingual) {
+    text = bilingual.text
+    displayText = bilingual.displayText
+    pushEvent(host, 'bilingual-ok', { lang, turn: rec.turn })
+  } else {
+    // 回落：中文稿 → 翻译（两步法，兼容 error/aborted 等非 completed 场景）。
+    const chineseText = await buildReportText(rec, cfg)
+    text = chineseText
+    displayText = chineseText
+    if (lang !== 'zh' && chineseText) {
+      const result = await translateReportDetailed(chineseText, cfg, lang)
+      if (result.text) {
+        text = result.text
+        displayText = `${result.text}\n${chineseText}`
+      } else {
+        translateError = result.error || 'unknown'
+        pushEvent(host, 'translate-skipped', { lang, reason: translateError, turn: rec.turn })
+        host.lastError = { at: Date.now(), kind: 'translate', message: `翻译成 ${lang} 失败（${translateError}），本轮改播中文` }
+      }
     }
   }
 
@@ -1001,6 +1014,78 @@ export async function buildReportText(rec, cfg = {}) {
     }
   }
   return composeReport(rec, cfg)
+}
+
+/**
+ * 合并双语生成：一次模型调用同时产出目标语种口播稿 + 中文对照行。
+ * 比「先中文摘要 → 再翻译」省一次 chat 调用（延迟减半）。
+ * 返回 { text, displayText } 或 null（失败时调用方回落到两步法）。
+ * 只在 kind==='completed' 且 language!=='zh' 时有意义；其他情况返回 null。
+ */
+export async function generateBilingualReport(rec, cfg = {}, lang = 'en') {
+  const target = normalizeLanguage(lang)
+  if (target === 'zh') return null
+  const kind = rec && rec.reason ? rec.reason : 'unknown'
+  if (kind !== 'completed') return null
+  if (String(cfg.summarizer || DEFAULTS.summarizer) === 'extract') return null
+  if (mimoBreaker.open('summary')) return null
+  const apiKey = resolveApiKey(cfg)
+  if (!apiKey) return null
+  const source = cleanText(rec.text)
+  if (source.length < 24) return null
+  const baseUrl = String(cfg.baseUrl || DEFAULTS.baseUrl).replace(/\/+$/, '')
+  const limit = Number(cfg.summaryMaxChars) > 20 ? Number(cfg.summaryMaxChars) : DEFAULTS.summaryMaxChars
+  const persona = personaPromptFor(cfg)
+  const announce = announceOf(kind, cfg)
+
+  const systemPrompt =
+    `${persona.text}\n` +
+    `你正在给对话里的用户做语音汇报。请根据下面的任务结果，同时输出两行：\n` +
+    `第一行：用${LANGUAGES[target]}说一句到两句口播稿（最多 ${limit} 字），语气符合你的人设，` +
+    `开头自然地表达"完成了"的意思（参考这句中文开场：「${announce}」，但不要直译，用${LANGUAGES[target]}的自然说法）。\n` +
+    `第二行：第一行的忠实中文版本（以「${announce}」开头）。\n` +
+    `严格只输出这两行，不要解释、不要引号、不要 Markdown。第一行绝对不能包含中文汉字。`
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs)
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'api-key': apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: cfg.summaryModel || DEFAULTS.summaryModel,
+        temperature: 0,
+        max_tokens: 300,
+        reasoning_effort: 'none',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: source.slice(0, 2400) },
+        ],
+      }),
+      signal: controller.signal,
+    })
+    const raw = await res.text()
+    if (!res.ok) throw new Error(`MiMo 双语 HTTP ${res.status}: ${raw.slice(0, 200)}`)
+    const payload = JSON.parse(raw)
+    const content = payload?.choices?.[0]?.message?.content
+    if (typeof content !== 'string') return null
+    const lines = content.split('\n').map((l) => l.trim()).filter(Boolean)
+    if (lines.length < 2) return null
+    const spoken = lines[0].replace(/^["""「『]+|["""」』]+$/g, '').trim()
+    const chinese = lines[1].replace(/^["""「『]+|["""」』]+$/g, '').trim()
+    if (spoken.length < 4 || chinese.length < 4) return null
+    // 泄漏检测：第一行不应含中文（日语除外，日语本身用汉字）
+    if (isSourceLanguageLeak(spoken, target)) return null
+    // 中文行应以 announce 开头（允许轻微偏差）
+    const dedupedZh = dedupeAnnounce(chinese, announce)
+    const finalZh = dedupedZh ? announce + dedupedZh : chinese
+    mimoBreaker.success('summary')
+    return { text: spoken.slice(0, 400), displayText: `${spoken.slice(0, 400)}\n${finalZh.slice(0, 400)}` }
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /** 把一条助手回复压成适合朗读的一两句（确定性路径）。 */
@@ -1563,7 +1648,9 @@ export async function synthesize(text, cfg) {
   // 语种差异：非中文合成明显更慢，实测韩语偶发超过 30s 才返回（触发 Abort）。
   const lang = normalizeLanguage(cfg.language)
   const configuredTimeout = Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs
-  const requestTimeout = Math.max(configuredTimeout, lang === 'zh' ? 0 : 60000)
+  const nonZhFloor = Number(cfg.otherLanguageTimeoutMs) > 1000 ? Number(cfg.otherLanguageTimeoutMs) : DEFAULTS.otherLanguageTimeoutMs
+  const requestTimeout = Math.max(configuredTimeout, lang === 'zh' ? 0 : nonZhFloor)
+  const longAudioThreshold = Number(cfg.longAudioSeconds) > 5 ? Number(cfg.longAudioSeconds) : DEFAULTS.longAudioSeconds
 
   const attempt = async (rateBoost = 0) => {
     // 异常长音频重试时临时提一点语速（不改用户的持久配置）。
@@ -1611,7 +1698,7 @@ export async function synthesize(text, cfg) {
       // 长音频保护：MiMo 偶发把一句短话说成 20s+（实测韩语出现过 33.5s），
       // 非中文语种再合成一次（临时提速），取更短的一条；两次都失败就用第一条。
       const chars = Array.from(String(text)).length
-      if (lang !== 'zh' && chars > 0 && chars < 200 && estimateSeconds(first) > 22) {
+      if (lang !== 'zh' && chars > 0 && chars < 200 && estimateSeconds(first) > longAudioThreshold) {
         try {
           const second = await attempt(0.15)
           return estimateSeconds(second) < estimateSeconds(first) ? second : first
@@ -1645,9 +1732,26 @@ export function estimateSeconds(base64Audio) {
  * 确定性变速：把 base64 mp3 用 ffmpeg atempo 变速（不变调），返回新的 base64。
  * 倍率 ≈1 时原样返回；任何失败都原样返回（变速是增强，不能让播报失败）。
  */
+
+// ffmpeg 可用性探测（懒加载、模块级缓存）：没有 ffmpeg 时语速静默失效，
+// 但 /state 会暴露这个状态，设置卡可以提示用户。
+let ffmpegProbe = null // null=未探测, true=可用, false=不可用
+export async function probeFfmpeg(cfg = {}) {
+  if (ffmpegProbe !== null) return ffmpegProbe
+  const ffmpeg = String(cfg.ffmpegPath || process.env.DSH_FFMPEG || 'ffmpeg')
+  try {
+    const out = await runProcess(ffmpeg, ['-hide_banner', '-version'])
+    ffmpegProbe = out.code === 0
+  } catch {
+    ffmpegProbe = false
+  }
+  return ffmpegProbe
+}
+
 export async function applySpeechRate(base64Audio, cfg = {}) {
   const factor = speechRateFactor(cfg)
   if (!Number.isFinite(factor) || Math.abs(factor - 1) < 0.01) return base64Audio
+  if (!(await probeFfmpeg(cfg))) return base64Audio
   const ffmpeg = String(cfg.ffmpegPath || process.env.DSH_FFMPEG || 'ffmpeg')
   const stamp = `${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
   const inFile = join(tmpdir(), `mimo-voice-in-${stamp}.mp3`)
@@ -1844,7 +1948,7 @@ export function avatarInfo(cfg = {}) {
     if (!file) return { path: '', ok: false, error: 'avatar 为空' }
     const info = statSync(file)
     const mime = /\.png$/i.test(file) ? 'image/png' : /\.jpe?g$/i.test(file) ? 'image/jpeg' : /\.gif$/i.test(file) ? 'image/gif' : 'image/webp'
-    return { path: file, ok: true, bytes: info.size, mime }
+    return { path: file, ok: true, bytes: info.size, mime, mtime: Math.round(info.mtimeMs) }
   } catch (error) {
     return { path: '', ok: false, error: String(error && error.message ? error.message : error) }
   }

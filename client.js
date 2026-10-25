@@ -14,11 +14,12 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
     const LANG_KEY = 'dsh.mimoVoiceReport.lang'
-    const CLIENT_VERSION = '1.30.9'
+    const CLIENT_VERSION = '1.31.0'
     const spoken = new Set()
 
     // ——— 播放音量：设置卡写、播放侧读（持久化真身在宿主 config.volume） ———
     const volumeState = { value: 1 }
+    let avatarVersion = 0
     function setCurrentVolume(value) {
       const n = Number(value)
       volumeState.value = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1
@@ -175,6 +176,40 @@ window.__ModuleLoader__.load({
         close: 'Close',
         avatarAlt: 'Whale girl',
         settings: 'Open voice settings (voice / volume / key)',
+      },
+      ja: {
+        titleOn: '音声レポート ON：タスク完了時に自動で読み上げます',
+        titleOff: '音声レポート OFF',
+        loading: '音声レポートを生成中…',
+        playing: '読み上げ中…',
+        blocked: '自動再生がブロックされました — クリックで再試行',
+        error: '音声レポート失敗 — クリックで再試行',
+        noAudio: 'このブラウザは音声を再生できません',
+        preparing: '音声レポートを準備中…',
+        cardMeta: '音声レポート',
+        blockedMeta: '自動再生ブロック · スピーカーをタップして再試行',
+        fallbackMeta: 'TTS 利用不可 · チャイムで代用',
+        translateFailed: '翻訳失敗 · 今回は中国語で読み上げます',
+        close: '閉じる',
+        avatarAlt: 'クジラ娘',
+        settings: '音声設定を開く（ボイス / 音量 / Key）',
+      },
+      ko: {
+        titleOn: '음성 리포트 켜짐: 작업 완료 시 자동 재생',
+        titleOff: '음성 리포트 꺼짐',
+        loading: '음성 리포트 생성 중…',
+        playing: '재생 중…',
+        blocked: '자동 재생이 차단되었습니다 — 클릭하여 재시도',
+        error: '음성 리포트 실 — 클릭하여 재시도',
+        noAudio: '이 브라우저는 오디오를 재생할 수 없습니다',
+        preparing: '음성 리포트 준비 중…',
+        cardMeta: '음성 리포트',
+        blockedMeta: '자동 재생 차단 · 스피커를 탭하여 재시도',
+        fallbackMeta: 'TTS 사용 불가 · 알림음으로 대체',
+        translateFailed: '번역 실패 · 이번에는 중국어로 읽습니다',
+        close: '닫기',
+        avatarAlt: '고래 소녀',
+        settings: '음성 설정 열기 (보이스 / 볼륨 / Key)',
       },
     }
 
@@ -347,8 +382,12 @@ window.__ModuleLoader__.load({
      */
     function pickText() {
       const forced = readLangOverride()
-      if (forced) return forced === 'en' ? TEXT.en : TEXT.zh
-      return /^en([-_]|$)/.test(hostLocale()) ? TEXT.en : TEXT.zh
+      if (forced) return TEXT[forced] || TEXT.zh
+      const locale = hostLocale()
+      if (/^ja([-_]|$)/.test(locale)) return TEXT.ja
+      if (/^ko([-_]|$)/.test(locale)) return TEXT.ko
+      if (/^en([-_]|$)/.test(locale)) return TEXT.en
+      return TEXT.zh
     }
 
     function SpeakerIcon(props) {
@@ -533,7 +572,9 @@ window.__ModuleLoader__.load({
           el.onended = function () {
             stopReveal()
             emit({ phase: 'done', shown: Array.from(text).length, transShown: transTotal })
-            hideCardSoon(2800)
+            // 自适应停留：基础 2.8s + 每字 60ms（原文+译文），上限 9s，保证双语字幕读得完。
+            const totalChars = Array.from(text).length + transTotal
+            hideCardSoon(Math.min(9000, 2800 + totalChars * 60))
             if (alive.current) setStatus('idle')
             report({ event: 'card-done', sessionId: sessionId, chars: Array.from(text).length })
           }
@@ -755,7 +796,7 @@ window.__ModuleLoader__.load({
             className: 'mv-card is-' + v.phase + (v.leaving ? ' is-leaving' : '') + (v.fallback ? ' is-fallback' : ''),
             role: 'status',
             'aria-live': 'polite',
-            'aria-label': v.phase === 'loading' || !full ? L.preparing : full,
+            'aria-label': v.phase === 'loading' || !full ? L.preparing : full + (v.translation ? '\n' + v.translation : ''),
           },
           h('div', { className: 'mv-glow', key: 'glow', 'aria-hidden': true }),
           avatarOk
@@ -766,7 +807,7 @@ window.__ModuleLoader__.load({
                   'div',
                   { className: 'mv-figure' },
                   h('img', {
-                    src: '/mimo-voice/avatar',
+                    src: '/mimo-voice/avatar' + (avatarVersion ? '?v=' + avatarVersion : ''),
                     alt: L.avatarAlt,
                     draggable: false,
                     onError: function () {
@@ -905,6 +946,7 @@ window.__ModuleLoader__.load({
             if (data && data.language) setLanguageState(String(data.language))
             if (data && data.languages && typeof data.languages === 'object') setLanguages(data.languages)
             if (data && data.speechRate && Number.isFinite(Number(data.speechRate.factor))) setSpeechRate(Number(data.speechRate.factor))
+            if (data && data.avatarVersion) avatarVersion = Number(data.avatarVersion) || 0
             const p = (data && data.persona) || {}
             setCallMe(String(p.callMe || ''))
             setHostOld(!data || !data.persona)
@@ -1086,10 +1128,20 @@ window.__ModuleLoader__.load({
               setVoice({ sample: String(v2.sample || voice.sample), presets: v2.presets })
             }
             // 若当前音色是方言而语种切到了非中文，回落到原版音色（方言项已隐藏）。
+            // 回落前记住用户之前选的克隆音色，切回中文时自动恢复。
             const stillDialect = String(v2.sample || '').indexOf('dialect-') >= 0
             const targetLang = String(data.language || next)
             if (stillDialect && targetLang !== 'zh') {
+              try { localStorage.setItem('dsh.mimoVoiceReport.lastCloneSample', v2.sample) } catch {}
               pickVoice('voice-sample.mp3')
+            } else if (!stillDialect && targetLang === 'zh') {
+              // 切回中文：如果之前记住了克隆音色且当前是原版，自动恢复。
+              let remembered = ''
+              try { remembered = localStorage.getItem('dsh.mimoVoiceReport.lastCloneSample') || '' } catch {}
+              if (remembered && v2.sample === 'voice-sample.mp3' && remembered !== 'voice-sample.mp3') {
+                pickVoice(remembered)
+                try { localStorage.removeItem('dsh.mimoVoiceReport.lastCloneSample') } catch {}
+              }
             }
             setNote('语种已保存并生效')
           })

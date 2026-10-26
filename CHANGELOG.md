@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.32.0 (2026-10-26)
+
+### Robustness
+- **Cancel on disconnect**: when the last browser listener goes away (client timeout, session switch, voice off), generation aborts at once — no fallback audio, no circuit-breaker strike, no cache write. Reference-counted, so a second tab sharing one generation does not kill it.
+- **Request generations (host + client)**: `force`/retry or a config change supersedes older work. A late response can neither overwrite a newer cache slot nor drive the popup, and stale `<audio>` events (including gesture catch-up playback) are ignored.
+- **Fatal failures fail fast**: `no-key` / `auth` / `quota` no longer burn a serial summarize + translate call before falling back to the deterministic Chinese summary.
+- **Summary circuit breaker**: 3 consecutive bilingual/summary failures skip model rewriting entirely; state and diagnostics listeners are per plugin instance, so a reload no longer inherits a tripped breaker.
+- **Speech budget**: one overall deadline caps every stage timeout, so the host stops shortly after the browser has given up instead of continuing to spend tokens.
+- **Config-fingerprint cache**: slots are keyed by turn + every generation-affecting setting (voice, language, persona, rate). Changing a setting regenerates; identical settings still skip the model call.
+- **Atomic state write**: conversation state is written to a temp file and renamed, so a crash mid-write cannot leave half a JSON; stored body text is truncated to 2400 chars.
+- **ffmpeg probe**: cached per executable path, failures retried after 60 s — installing ffmpeg takes effect without a restart.
+- Client: spoken-record set capped at 64 entries (long-lived pages no longer grow), portrait self-heals after a load error, and `avatarVersion` is synced from `/config` without opening the settings card.
+
+### Animation fixes
+- Glow was permanently at full opacity: the entrance animation's `both` fill overrode the `.is-loading` (0.28) / `.is-done` (0.10) rules. The animation now only scales, opacity is left to the state rules, and `@starting-style` keeps the first fade-in.
+- Per-character rise is attached only while playing, so the bulk fill on done/error no longer jitters a whole line in one frame.
+- Caret gets a negative right margin so it cannot be pushed alone onto the next line; the loading sweep animates `transform` instead of `left`; the loading button icon pulses (both silent under `prefers-reduced-motion`).
+
+### Tests
+- 18 new assertions covering generations, cancellation, budget capping, breaker isolation, config-fingerprint cache, ffmpeg guard, spoken cap, portrait self-heal
+- Total: **55 passed**
+
 ## v1.31.0 (2026-10-25)
 
 ### Optimizations

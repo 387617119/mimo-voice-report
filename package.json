@@ -1,6 +1,6 @@
 {
   "name": "mimo-voice-report",
-  "version": "1.31.0",
+  "version": "1.32.0",
   "private": false,
   "type": "module",
   "scripts": {

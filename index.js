@@ -15,7 +15,8 @@
  * API Key 解析顺序：config.apiKey → 环境变量 → $DSH_HOME/.credentials.yaml 的 refs。
  * Key 只在宿主进程使用，不下发到浏览器。
  */
-import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -116,7 +117,7 @@ export function personaPromptFor(cfg = {}) {
 }
 
 /** 组装摘要模型的 system 提示词：人设句（可自定义）+ 全体通用的结构性规则。 */
-export function buildSummaryPrompt(cfg = {}, limit = DEFAULTS.summaryMaxChars, announce = '') {
+export function buildSummaryPrompt(cfg = {}, limit = 64, announce = '') {
   const persona = personaPromptFor(cfg)
   return (
     persona.text +
@@ -164,6 +165,13 @@ const DEFAULTS = {
   otherLanguageTimeoutMs: 60000,
   /** 长音频保护阈值（秒）：估算时长超过它就再合成一次取更短的（MiMo 偶发拖长）。 */
   longAudioSeconds: 22,
+  /**
+   * 单次播报生成的总时间预算（毫秒）：摘要/翻译/TTS 各阶段的超时都会被剩余预算封顶，
+   * 预算耗尽直接走兜底。必须小于浏览器端的 100 秒请求上限，保证"前端放弃时宿主已收尾"。
+   */
+  reportBudgetMs: 90000,
+  /** ffmpeg 探测/变速子进程的单次执行超时（毫秒）：防止挂死的 ffmpeg 卡住整轮播报。 */
+  ffmpegTimeoutMs: 15000,
   /** 自定义语速指令（自然语言）。留空 = 按语种自动补偿（日语/韩语/英语会提速）。 */
   speechRate: '',
   /** 方言口音（MiMo-TTS 风格指令通道）：空 = 普通话；可选 粤语/四川话/东北话/河南话/台湾腔。 */
@@ -295,7 +303,7 @@ export function speechRateStyle(cfg = {}) {
 }
 
 const CREDENTIAL_NAMES = ['MIMO_API_KEY', 'MIMO_TTS_API_KEY', 'XIAOMI_TOKEN_PLAN_CN_API_KEY']
-const VERSION = '1.31.0'
+const VERSION = '1.32.0'
 const MAX_SESSIONS = 60
 const MAX_CACHE = 12
 const MAX_BODY = 64 * 1024
@@ -316,10 +324,12 @@ export const inject = ['webServer']
 export function apply(ctx, config = {}) {
   const cfg = { ...DEFAULTS, ...(config || {}) }
   const host = createHostState()
-  // 同 turn 的 /report 并发去重（双开标签页、连点、force 重试共用一次生成）。
+  const breaker = createMimoBreaker()
+  // 同 turn、同生成配置的普通请求合并；force 或配置变化会替换旧任务。
   const inflight = new Map()
-  // 熔断开/关写进诊断事件流，/state.events 里可见。
-  mimoBreaker.listen((event) => pushEvent(host, event.type, event))
+  const latestReportGeneration = new Map()
+  // 熔断状态与诊断监听器都限定在本次插件实例内，重载后不再互相串线。
+  ctx.effect(() => breaker.listen((event) => pushEvent(host, event.type, event)))
 
   // sessions: sessionId -> 最近一轮的记录；保持插入顺序，超出上限就丢最旧的。
   const sessions = new Map()
@@ -333,9 +343,13 @@ export function apply(ctx, config = {}) {
       const data = {}
       for (const [id, rec] of sessions) {
         if (!rec || !rec.endedAt) continue
-        data[id] = { turn: rec.turn, text: rec.text, reason: rec.reason, endedAt: rec.endedAt }
+        // 正文截断：模型路径本来只取前 2400 字，磁盘上不留大段对话原文。
+        data[id] = { turn: rec.turn, text: String(rec.text || '').slice(0, 2400), reason: rec.reason, endedAt: rec.endedAt }
       }
-      writeFileSync(STATE_FILE, JSON.stringify(data))
+      // 原子写：先写临时文件再改名，插件重载/崩溃不会留下半截 JSON。
+      const tmp = STATE_FILE + '.tmp'
+      writeFileSync(tmp, JSON.stringify(data))
+      renameSync(tmp, STATE_FILE)
     } catch {}
   }
   try {
@@ -425,7 +439,7 @@ export function apply(ctx, config = {}) {
     path: '/mimo-voice',
     handler: async (req, res) => {
       try {
-        await handleRequest({ req, res, cfg, record: readRecord, cache, host, inflight, editor: () => ctx.get('configEditor') })
+        await handleRequest({ req, res, cfg, record: readRecord, cache, host, inflight, breaker, latestReportGeneration, editor: () => ctx.get('configEditor') })
       } catch (error) {
         json(res, 500, { ok: false, code: 'handler-failed', message: String(error && error.message ? error.message : error) })
       }
@@ -434,7 +448,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.webServer.register(route))
 }
 
-async function handleRequest({ req, res, cfg, record, cache, host, inflight, editor }) {
+export async function handleRequest({ req, res, cfg, record, cache, host, inflight, breaker, latestReportGeneration, editor }) {
   const url = new URL(req.url || '/', 'http://127.0.0.1')
   const method = (req.method || 'GET').toUpperCase()
 
@@ -679,10 +693,9 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
       })
     }
 
-    // 缓存按 turn 记（key 不含正文：结束语是从池子里随机抽的、摘要模型输出也有波动，
-    // 把文本掺进 key 会让同 turn 的缓存几乎永远 miss）。先查缓存、后生成：
-    // 命中时连那次摘要模型调用都省掉；force 重试想"换一句"就跳过缓存重新生成。
-    const turnKey = `${sessionId}:${rec.turn}:${rec.endedAt}`
+    // 同一个 turn 可以因音色、语种、人设等设置变化生成不同结果。
+    // 指纹包含所有会影响文案或音频的配置，但不含正文：同设置的重复播放仍应省掉模型调用。
+    const turnKey = `${sessionId}:${rec.turn}:${rec.endedAt}:${reportConfigFingerprint(cfg)}`
     if (body.force !== true) {
       const hit = cache.get(turnKey)
       if (hit) {
@@ -692,17 +705,50 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
       }
     }
 
-    // 并发合并：同 turn 的请求共用同一次生成（produceReport 永远 resolve，不会 reject）。
-    let producer = inflight.get(turnKey)
-    if (!producer) {
-      producer = produceReport({ sessionId, rec, force: body.force === true, cfg, cache, host, turnKey })
-      inflight.set(turnKey, producer)
+    // 普通请求按 turnKey 合并。force 或配置变化会替换旧任务；旧任务完成时
+    // 既不能删除新任务，也不能把自己的结果写回同一个缓存槽（见 produceReport 的代次检查）。
+    let task = inflight.get(turnKey)
+    if (!task || body.force === true) {
+      const recordSnapshot = { ...rec }
+      const generation = (host.nextReportGeneration = (host.nextReportGeneration || 0) + 1)
+      latestReportGeneration.set(turnKey, generation)
+      // 浏览器断连取消：所有等待者都断开时 abort，produceReport 各阶段的 fetch 立即中止。
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+      const promise = produceReport({
+        sessionId,
+        rec: recordSnapshot,
+        force: body.force === true,
+        cfg: { ...cfg },
+        cache,
+        host,
+        turnKey,
+        breaker,
+        generation,
+        latestReportGeneration,
+        signal: controller ? controller.signal : undefined,
+        isCancelled: () => Boolean(controller && controller.signal.aborted),
+      })
+      task = { promise, refs: 0, controller }
+      inflight.set(turnKey, task)
       const clear = () => {
-        if (inflight.get(turnKey) === producer) inflight.delete(turnKey)
+        if (inflight.get(turnKey) === task) {
+          inflight.delete(turnKey)
+          if (latestReportGeneration.get(turnKey) === generation) latestReportGeneration.delete(turnKey)
+        }
       }
-      producer.then(clear, clear)
+      promise.then(clear, clear)
     }
-    return json(res, 200, await producer)
+    // 引用计数：这个请求断开时减一，归零则取消整个生成（双开标签页共用一次生成时不误伤）。
+    task.refs++
+    try {
+      req.on('close', function () {
+        // 正常结束后连接关闭不算提前断开。
+        if (res.writableEnded) return
+        task.refs--
+        if (task.refs <= 0 && task.controller) task.controller.abort()
+      })
+    } catch {}
+    return json(res, 200, await task.promise)
   }
 
   if (url.pathname === '/mimo-voice/say') {
@@ -716,13 +762,13 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
     if (!text) return json(res, 400, { ok: false, code: 'missing-text' })
     try {
       const audio = await synthesize(text, cfg)
-      mimoBreaker.success('tts')
+      breaker.success('tts')
       pushEvent(host, 'say-ok', { chars: Array.from(text).length, bytes: audio.length })
       return json(res, 200, { ok: true, text, audio, mime: 'audio/mpeg', voice: cfg.voice, cached: false })
     } catch (error) {
       // 试听端点不兜底提示音（它就是要验证 MiMo 本身），但要计数、要给出具体原因。
       const info = classifyMimoError(error)
-      mimoBreaker.fail('tts', info.kind, cfg)
+      breaker.fail('tts', info.kind, cfg)
       host.failures += 1
       host.lastError = errorSnapshot(info)
       pushEvent(host, 'say-failed', { kind: info.kind, status: info.status || 0 })
@@ -807,8 +853,8 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
       lastClient: host.lastClient,
       events: host.events,
       mimo: {
-        tts: mimoBreaker.state().tts,
-        summary: mimoBreaker.state().summary,
+        tts: breaker.state().tts,
+        summary: breaker.state().summary,
         fallbacks: host.fallbacks,
         ding: Boolean(fallbackDingDataUrl(cfg)),
       },
@@ -829,34 +875,103 @@ async function handleRequest({ req, res, cfg, record, cache, host, inflight, edi
 }
 
 /**
+ * 生成配置指纹：参与同 turn 缓存键。覆盖所有会影响"文案或音频"的设置；
+ * 采样文件按路径+mtime+size 纳入，替换采样后同 turn 的旧缓存不再复用。
+ * 故意不含 apiKey（换 Key 不改变声音）和宿主诊断字段，避免无意义地打爆缓存。
+ */
+export function reportConfigFingerprint(cfg = {}) {
+  const sample = voiceSampleInfo(cfg)
+  const persona = personaPromptFor(cfg)
+  const fields = {
+    baseUrl: String(cfg.baseUrl || ''),
+    model: String(cfg.model || ''),
+    voice: String(cfg.voice || ''),
+    voiceSample: String(cfg.voiceSample || ''),
+    sampleMtime: sample.ok ? sample.mtime : 0,
+    sampleBytes: sample.ok ? sample.bytes : 0,
+    style: String(cfg.style || ''),
+    tags: String(cfg.tags || ''),
+    callMe: String(cfg.callMe || ''),
+    customAnnounces: normalizeCustomLibrary(cfg.customAnnounces),
+    customOnly: cfg.customOnly === true,
+    summarizer: String(cfg.summarizer || ''),
+    summaryModel: String(cfg.summaryModel || ''),
+    summaryMaxChars: Number(cfg.summaryMaxChars) || 0,
+    maxChars: Number(cfg.maxChars) || 0,
+    language: normalizeLanguage(cfg.language),
+    keepCloneForOtherLanguages: cfg.keepCloneForOtherLanguages === true,
+    speechRate: String(cfg.speechRate || ''),
+    speechRateFactor: Number.isFinite(Number(cfg.speechRateFactor)) ? Number(cfg.speechRateFactor) : '',
+    otherLanguageTimeoutMs: Number(cfg.otherLanguageTimeoutMs) || 0,
+    longAudioSeconds: Number(cfg.longAudioSeconds) || 0,
+    ffmpegPath: String(cfg.ffmpegPath || ''),
+    personaId: persona.id,
+    personaText: persona.text,
+  }
+  return createHash('sha256').update(JSON.stringify(fields)).digest('hex').slice(0, 20)
+}
+
+/**
  * 生成一次播报载荷（/report 的核心；独立于 res，并发请求共用同一次生成）。
  * 所有失败都折进载荷返回（兜底提示音或 ok:false），不会 reject。
+ * generation/latestReportGeneration：force 替换旧任务后，只有最新代次能写回缓存。
  */
-async function produceReport({ sessionId, rec, force, cfg, cache, host, turnKey }) {
+async function produceReport({ sessionId, rec, force, cfg, cache, host, turnKey, breaker, generation, latestReportGeneration, signal, isCancelled }) {
   const lang = normalizeLanguage(cfg.language)
   let text, displayText, translateError = ''
 
+  // —— 播报总预算：各阶段超时被剩余预算封顶，防止"浏览器已放弃、宿主还在烧额度"。 ——
+  const budgetMs = Number(cfg.reportBudgetMs) > 5000 ? Number(cfg.reportBudgetMs) : DEFAULTS.reportBudgetMs
+  const deadline = Date.now() + budgetMs
+  const remainingMs = () => deadline - Date.now()
+  const stageTimeout = () => Math.max(1000, Math.min(Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs, remainingMs()))
+  const outOfBudget = () => remainingMs() <= 500
+  const cancelled = () => Boolean(isCancelled && isCancelled())
+  const stageOpts = () => ({ timeoutMs: stageTimeout(), signal })
+
+  // 这些根因下摘要/翻译注定同样失败（没 Key / 鉴权 / 额度），不再串行浪费调用。
+  const FATAL_BILINGUAL_KINDS = ['no-key', 'auth', 'quota']
+
   // 优先走合并双语生成（一次调用同时产出目标语种 + 中文对照，省一半延迟）。
-  // 仅 completed + 非中文 + model summarizer 时可用；失败则回落到两步法。
-  const bilingual = await generateBilingualReport(rec, cfg, lang)
-  if (bilingual) {
+  // 仅 completed + 非中文 + model summarizer 时可用；失败按瞬态性分类决定回落方式。
+  const bilingual = await generateBilingualReport(rec, cfg, lang, breaker || mimoBreaker, stageOpts())
+  let bilingualFatal = false
+  if (bilingual && bilingual.ok) {
     text = bilingual.text
     displayText = bilingual.displayText
     pushEvent(host, 'bilingual-ok', { lang, turn: rec.turn })
   } else {
+    if (bilingual && bilingual.info) {
+      // 双语失败计入 summary 熔断：持续性故障（如 401）三连败后自动跳过模型改写。
+      breaker.fail('summary', bilingual.info.kind, cfg)
+      pushEvent(host, 'bilingual-failed', { kind: bilingual.info.kind, turn: rec.turn })
+      bilingualFatal = FATAL_BILINGUAL_KINDS.includes(bilingual.info.kind)
+      host.lastError = { at: Date.now(), kind: 'bilingual:' + bilingual.info.kind, message: bilingual.info.message || '双语生成失败，回落两步法' }
+    }
     // 回落：中文稿 → 翻译（两步法，兼容 error/aborted 等非 completed 场景）。
-    const chineseText = await buildReportText(rec, cfg)
+    // 致命根因或预算耗尽时直接走确定性抽取，不再打摘要模型。
+    const chineseText = bilingualFatal || outOfBudget()
+      ? composeReport(rec, cfg)
+      : await buildReportText(rec, cfg, breaker || mimoBreaker, stageOpts())
     text = chineseText
     displayText = chineseText
     if (lang !== 'zh' && chineseText) {
-      const result = await translateReportDetailed(chineseText, cfg, lang)
-      if (result.text) {
-        text = result.text
-        displayText = `${result.text}\n${chineseText}`
-      } else {
-        translateError = result.error || 'unknown'
+      // 瞬态失败（网络/超时/5xx）才值得再试一次翻译；致命根因或预算耗尽直接播中文。
+      const bilingualTransient = Boolean(bilingual && bilingual.info && bilingual.info.transient)
+      if (bilingualFatal || outOfBudget() || (bilingual && bilingual.info && !bilingualTransient)) {
+        translateError = bilingualFatal || (bilingual && bilingual.info && !bilingualTransient) ? 'bilingual-failed' : 'budget'
         pushEvent(host, 'translate-skipped', { lang, reason: translateError, turn: rec.turn })
-        host.lastError = { at: Date.now(), kind: 'translate', message: `翻译成 ${lang} 失败（${translateError}），本轮改播中文` }
+        host.lastError = { at: Date.now(), kind: 'translate', message: `翻译成 ${lang} 被跳过（${translateError}），本轮改播中文` }
+      } else {
+        const result = await translateReportDetailed(chineseText, cfg, lang, stageOpts())
+        if (result.text) {
+          text = result.text
+          displayText = `${result.text}\n${chineseText}`
+        } else {
+          translateError = result.error || 'unknown'
+          pushEvent(host, 'translate-skipped', { lang, reason: translateError, turn: rec.turn })
+          host.lastError = { at: Date.now(), kind: 'translate', message: `翻译成 ${lang} 失败（${translateError}），本轮改播中文` }
+        }
       }
     }
   }
@@ -888,15 +1003,28 @@ async function produceReport({ sessionId, rec, force, cfg, cache, host, turnKey 
     }
   }
 
-  if (!force && mimoBreaker.open('tts')) {
-    const kind = mimoBreaker.kind('tts') || 'cooldown'
+  // 浏览器断连（超时放弃/切会话/关语音）：立刻收尾，不播兜底、不计熔断、不写缓存。
+  if (cancelled()) {
+    pushEvent(host, 'report-cancelled', { turn: rec.turn })
+    return { ok: false, code: 'cancelled', message: '客户端已断开，本轮生成已取消', text, displayText, turn: rec.turn, reason: rec.reason, endedAt: rec.endedAt, cached: false }
+  }
+
+  if (!force && breaker.open('tts')) {
+    const kind = breaker.kind('tts') || 'cooldown'
     host.lastError = { at: Date.now(), kind, message: 'MiMo 连续失败，冷却中' }
     return sendFallback('cooldown', 'MiMo 连续失败，冷却中；稍后自动恢复，点小喇叭可立即重试')
   }
 
+  // 预算耗尽：不再发起 TTS，文案照常显示，声音走兜底。
+  if (outOfBudget()) {
+    pushEvent(host, 'budget-exhausted', { turn: rec.turn, remaining: remainingMs() })
+    host.lastError = { at: Date.now(), kind: 'budget', message: '本轮播报生成超预算，跳过 TTS 直接兜底' }
+    return sendFallback('budget', '这轮生成时间超出预算，已用提示音代替')
+  }
+
   try {
-    const audio = await synthesize(text, cfg)
-    mimoBreaker.success('tts')
+    const audio = await synthesize(text, cfg, stageOpts())
+    breaker.success('tts')
     const payload = {
       ok: true,
       fallback: false,
@@ -912,7 +1040,9 @@ async function produceReport({ sessionId, rec, force, cfg, cache, host, turnKey 
       endedAt: rec.endedAt,
       cached: false,
     }
-    cache.set(turnKey, payload)
+    if (!cancelled() && latestReportGeneration.get(turnKey) === generation) {
+      cache.set(turnKey, payload)
+    }
     while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value)
     host.reports += 1
     host.lastReport = {
@@ -928,8 +1058,13 @@ async function produceReport({ sessionId, rec, force, cfg, cache, host, turnKey 
     pushEvent(host, 'tts-ok', { turn: rec.turn, bytes: audio.length, chars: Array.from(text).length })
     return payload
   } catch (error) {
+    // 取消不是 MiMo 的错：不计熔断、不算失败次数，只记事件。
+    if (cancelled()) {
+      pushEvent(host, 'report-cancelled', { turn: rec.turn })
+      return { ok: false, code: 'cancelled', message: '客户端已断开，本轮生成已取消', text, displayText, translateError: translateError || undefined, turn: rec.turn, reason: rec.reason, endedAt: rec.endedAt, cached: false }
+    }
     const info = classifyMimoError(error)
-    mimoBreaker.fail('tts', info.kind, cfg)
+    breaker.fail('tts', info.kind, cfg)
     host.failures += 1
     host.lastError = errorSnapshot(info)
     pushEvent(host, 'tts-failed', { kind: info.kind, status: info.status || 0, turn: rec.turn })
@@ -994,22 +1129,22 @@ function messageText(message) {
  * 默认让 MiMo 对话模型把最后一条助手回复改写成口播稿（听感自然），
  * 模型不可用、超时或输出不合格时退回确定性抽取。
  */
-export async function buildReportText(rec, cfg = {}) {
+export async function buildReportText(rec, cfg = {}, breaker = mimoBreaker, opts = {}) {
   const kind = rec && rec.reason ? rec.reason : 'unknown'
   // 熔断打开时跳过模型改写，直接走抽取式——冷却期里不再白等一次注定失败（或超时）的请求。
-  if (kind === 'completed' && String(cfg.summarizer || DEFAULTS.summarizer) !== 'extract' && !mimoBreaker.open('summary')) {
+  if (kind === 'completed' && String(cfg.summarizer || DEFAULTS.summarizer) !== 'extract' && !breaker.open('summary')) {
     // 称呼在这里生效：announce 已带称呼，dedupeAnnounce 的前缀剥离同样按它对齐。
     const announce = announceOf(kind, cfg)
     const source = cleanText(rec.text)
     if (source.length >= 24) {
       try {
-        const spoken = await summarizeWithModel(source, cfg, announce)
-        mimoBreaker.success('summary')
+        const spoken = await summarizeWithModel(source, cfg, announce, opts)
+        breaker.success('summary')
         const deduped = spoken ? dedupeAnnounce(spoken, announce) : ''
         if (deduped) return announce + deduped
       } catch (error) {
         // 摘要模型不可用就记入熔断，然后退回抽取式——播报不能因为改写失败而消失。
-        mimoBreaker.fail('summary', classifyMimoError(error).kind, cfg)
+        breaker.fail('summary', classifyMimoError(error).kind, cfg)
       }
     }
   }
@@ -1019,16 +1154,17 @@ export async function buildReportText(rec, cfg = {}) {
 /**
  * 合并双语生成：一次模型调用同时产出目标语种口播稿 + 中文对照行。
  * 比「先中文摘要 → 再翻译」省一次 chat 调用（延迟减半）。
- * 返回 { text, displayText } 或 null（失败时调用方回落到两步法）。
- * 只在 kind==='completed' 且 language!=='zh' 时有意义；其他情况返回 null。
+ * 返回 { ok:true, text, displayText }、{ ok:false, info }（失败且带分类）或 null（前置条件不满足，跳过）。
+ * info.kind: cancelled / bad-output / auth / no-key / quota / timeout / network / server 等；
+ * info.transient 标记"再来一次可能就好"，调用方据此决定是否回落两步法。
  */
-export async function generateBilingualReport(rec, cfg = {}, lang = 'en') {
+export async function generateBilingualReport(rec, cfg = {}, lang = 'en', breaker = mimoBreaker, opts = {}) {
   const target = normalizeLanguage(lang)
   if (target === 'zh') return null
   const kind = rec && rec.reason ? rec.reason : 'unknown'
   if (kind !== 'completed') return null
   if (String(cfg.summarizer || DEFAULTS.summarizer) === 'extract') return null
-  if (mimoBreaker.open('summary')) return null
+  if (breaker.open('summary')) return null
   const apiKey = resolveApiKey(cfg)
   if (!apiKey) return null
   const source = cleanText(rec.text)
@@ -1047,7 +1183,13 @@ export async function generateBilingualReport(rec, cfg = {}, lang = 'en') {
     `严格只输出这两行，不要解释、不要引号、不要 Markdown。第一行绝对不能包含中文汉字。`
 
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs)
+  linkSignal(opts.signal, controller)
+  const stageTimeout = Number(opts.timeoutMs) > 1000
+    ? Number(opts.timeoutMs)
+    : Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs
+  const timer = setTimeout(() => controller.abort(), stageTimeout)
+  // 校验类失败（模型输出不合格）：非瞬态，不该再串行重试整条翻译链。
+  const badOutput = (message) => ({ ok: false, info: { kind: 'bad-output', message, transient: false } })
   try {
     const res = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
@@ -1065,24 +1207,33 @@ export async function generateBilingualReport(rec, cfg = {}, lang = 'en') {
       signal: controller.signal,
     })
     const raw = await res.text()
-    if (!res.ok) throw new Error(`MiMo 双语 HTTP ${res.status}: ${raw.slice(0, 200)}`)
+    if (!res.ok) {
+      const error = new Error(`MiMo 双语 HTTP ${res.status}: ${raw.slice(0, 200)}`)
+      error.status = res.status
+      error.body = raw
+      throw error
+    }
     const payload = JSON.parse(raw)
     const content = payload?.choices?.[0]?.message?.content
-    if (typeof content !== 'string') return null
+    if (typeof content !== 'string') return badOutput('双语输出里没有文本')
     const lines = content.split('\n').map((l) => l.trim()).filter(Boolean)
-    if (lines.length < 2) return null
+    if (lines.length < 2) return badOutput('双语输出不足两行')
     const spoken = lines[0].replace(/^["""「『]+|["""」』]+$/g, '').trim()
     const chinese = lines[1].replace(/^["""「『]+|["""」』]+$/g, '').trim()
-    if (spoken.length < 4 || chinese.length < 4) return null
+    if (spoken.length < 4 || chinese.length < 4) return badOutput('双语输出太短')
     // 泄漏检测：第一行不应含中文（日语除外，日语本身用汉字）
-    if (isSourceLanguageLeak(spoken, target)) return null
+    if (isSourceLanguageLeak(spoken, target)) return badOutput('第一行泄漏了中文，判定未翻译')
     // 中文行应以 announce 开头（允许轻微偏差）
     const dedupedZh = dedupeAnnounce(chinese, announce)
     const finalZh = dedupedZh ? announce + dedupedZh : chinese
-    mimoBreaker.success('summary')
-    return { text: spoken.slice(0, 400), displayText: `${spoken.slice(0, 400)}\n${finalZh.slice(0, 400)}` }
-  } catch {
-    return null
+    breaker.success('summary')
+    return { ok: true, text: spoken.slice(0, 400), displayText: `${spoken.slice(0, 400)}\n${finalZh.slice(0, 400)}` }
+  } catch (error) {
+    if (opts.signal && opts.signal.aborted) {
+      return { ok: false, info: { kind: 'cancelled', message: '客户端已断开', transient: false } }
+    }
+    const info = classifyMimoError(error)
+    return { ok: false, info: { kind: info.kind, message: info.message, transient: ['timeout', 'network', 'server'].includes(info.kind) } }
   } finally {
     clearTimeout(timer)
   }
@@ -1292,7 +1443,23 @@ export function cleanText(raw) {
 }
 
 /** 让 MiMo 对话模型把最后一条助手回复改写成一句口语化汇报。 */
-export async function summarizeWithModel(source, cfg = {}, announce = '') {
+/**
+ * 把外部取消信号（如浏览器断连）联动到某阶段自己的超时控制器：
+ * 任一触发即 abort，fetch 立刻以 AbortError 拒绝。手动监听而非 AbortSignal.any，
+ * 兼容尚不支持 any() 的 Node 20 小版本。
+ */
+function linkSignal(external, controller) {
+  if (!external || !controller) return
+  if (external.aborted) {
+    controller.abort()
+    return
+  }
+  try {
+    external.addEventListener('abort', function () { controller.abort() }, { once: true })
+  } catch {}
+}
+
+export async function summarizeWithModel(source, cfg = {}, announce = '', opts = {}) {
   const apiKey = resolveApiKey(cfg)
   if (!apiKey) return ''
   const baseUrl = String(cfg.baseUrl || DEFAULTS.baseUrl).replace(/\/+$/, '')
@@ -1316,7 +1483,12 @@ export async function summarizeWithModel(source, cfg = {}, announce = '') {
     // 关掉思考链：改写任务不需要推理，能省掉几秒。
     if (withReasoningHint) body.reasoning_effort = 'none'
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs)
+    // 预算封顶后的阶段超时（opts.timeoutMs）+ 外部取消信号（opts.signal）一起联动。
+    linkSignal(opts.signal, controller)
+    const stageTimeout = Number(opts.timeoutMs) > 1000
+      ? Number(opts.timeoutMs)
+      : Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs
+    const timer = setTimeout(() => controller.abort(), stageTimeout)
     try {
       const res = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
@@ -1365,7 +1537,7 @@ export async function translateReport(text, cfg = {}, lang = 'en') {
  * 翻译的详细版本：返回 { text, error }。
  * text 为空且 error 有值 = 翻译失败（调用方应记录原因，而不是静默回落）。
  */
-export async function translateReportDetailed(text, cfg = {}, lang = 'en') {
+export async function translateReportDetailed(text, cfg = {}, lang = 'en', opts = {}) {
   const target = normalizeLanguage(lang)
   const source = String(text || '').trim()
   if (target === 'zh' || !source) return { text: '', error: 'empty-or-zh' }
@@ -1382,7 +1554,11 @@ export async function translateReportDetailed(text, cfg = {}, lang = 'en') {
 
   const attempt = async () => {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs)
+    linkSignal(opts.signal, controller)
+    const stageTimeout = Number(opts.timeoutMs) > 1000
+      ? Number(opts.timeoutMs)
+      : Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs
+    const timer = setTimeout(() => controller.abort(), stageTimeout)
     try {
       const res = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
@@ -1427,6 +1603,8 @@ export async function translateReportDetailed(text, cfg = {}, lang = 'en') {
     } catch (error) {
       const kind = classifyMimoError(error).kind
       lastError = `${kind}:${String((error && error.message) || error).slice(0, 80)}`
+      // 外部取消（浏览器断连）不是瞬态故障，绝不重试。
+      if (opts.signal && opts.signal.aborted) break
       // 只对「再来一次可能就好」的错误重试：瞬态网络/超时/5xx。
       // 实测宿主进程偶发 `fetch failed`（连接复用被打断），重试一次即可恢复。
       if (round === 0 && (kind === 'network' || kind === 'timeout' || kind === 'server')) continue
@@ -1529,54 +1707,62 @@ export function classifyMimoError(error) {
 }
 
 /**
- * 熔断器：连续 3 次失败进入冷却期（默认 5 分钟），期间不再打 MiMo——
+ * 熔断器工厂：每个插件实例持有一份独立状态与监听器，插件重载后不会串线。
+ * 连续 3 次失败进入冷却期（默认 5 分钟），期间不再打 MiMo——
  * 摘要直接走抽取式、TTS 直接发兜底提示音，避免每次播报都白等一次超时。
  * force 请求可穿透冷却（设置卡的"重试"就是 force）。
+ * 导出的 mimoBreaker 单例仅供旧测试 / 独立调用纯函数时的默认回落。
  */
-const BREAKER = {
-  summary: { fails: 0, until: 0, kind: '' },
-  tts: { fails: 0, until: 0, kind: '' },
+export function createMimoBreaker() {
+  const BREAKER = {
+    summary: { fails: 0, until: 0, kind: '' },
+    tts: { fails: 0, until: 0, kind: '' },
+  }
+  let breakerListener = null
+
+  return {
+    state() {
+      const now = Date.now()
+      const shape = (b) => ({ fails: b.fails, open: now < b.until, cooldownUntil: b.until, lastKind: b.kind })
+      return { summary: shape(BREAKER.summary), tts: shape(BREAKER.tts) }
+    },
+    open(which) {
+      return Date.now() < BREAKER[which].until
+    },
+    kind(which) {
+      return BREAKER[which].kind
+    },
+    fail(which, kind, cfg = {}) {
+      const b = BREAKER[which]
+      const wasOpen = Date.now() < b.until
+      b.fails += 1
+      b.kind = kind || 'unknown'
+      const ms = Number(cfg.cooldownMs) > 10000 ? Number(cfg.cooldownMs) : DEFAULTS.cooldownMs
+      if (b.fails >= 3) b.until = Date.now() + ms
+      if (b.fails === 3 && !wasOpen && breakerListener) {
+        breakerListener({ type: 'breaker-open', which, kind: b.kind, cooldownMs: ms })
+      }
+    },
+    success(which) {
+      const b = BREAKER[which]
+      const wasOpen = Date.now() < b.until
+      BREAKER[which] = { fails: 0, until: 0, kind: '' }
+      if (wasOpen && breakerListener) breakerListener({ type: 'breaker-recovered', which })
+    },
+    listen(fn) {
+      breakerListener = typeof fn === 'function' ? fn : null
+      return function () {
+        if (breakerListener === fn) breakerListener = null
+      }
+    },
+    resetForTest() {
+      for (const key of Object.keys(BREAKER)) BREAKER[key] = { fails: 0, until: 0, kind: '' }
+      breakerListener = null
+    },
+  }
 }
 
-/** apply() 里注册：熔断开/关写进诊断事件流（/state.events）。 */
-let breakerListener = null
-
-export const mimoBreaker = {
-  state() {
-    const now = Date.now()
-    const shape = (b) => ({ fails: b.fails, open: now < b.until, cooldownUntil: b.until, lastKind: b.kind })
-    return { summary: shape(BREAKER.summary), tts: shape(BREAKER.tts) }
-  },
-  open(which) {
-    return Date.now() < BREAKER[which].until
-  },
-  kind(which) {
-    return BREAKER[which].kind
-  },
-  fail(which, kind, cfg = {}) {
-    const b = BREAKER[which]
-    const wasOpen = Date.now() < b.until
-    b.fails += 1
-    b.kind = kind || 'unknown'
-    const ms = Number(cfg.cooldownMs) > 10000 ? Number(cfg.cooldownMs) : DEFAULTS.cooldownMs
-    if (b.fails >= 3) b.until = Date.now() + ms
-    if (b.fails === 3 && !wasOpen && breakerListener) {
-      breakerListener({ type: 'breaker-open', which, kind: b.kind, cooldownMs: ms })
-    }
-  },
-  success(which) {
-    const b = BREAKER[which]
-    const wasOpen = Date.now() < b.until
-    BREAKER[which] = { fails: 0, until: 0, kind: '' }
-    if (wasOpen && breakerListener) breakerListener({ type: 'breaker-recovered', which })
-  },
-  listen(fn) {
-    breakerListener = typeof fn === 'function' ? fn : null
-  },
-  resetForTest() {
-    for (const key of Object.keys(BREAKER)) BREAKER[key] = { fails: 0, until: 0, kind: '' }
-  },
-}
+export const mimoBreaker = createMimoBreaker()
 
 /** 兜底提示音：MiMo 不可用时播的内置"叮"（8KB wav，随插件发布）。留空/文件缺失则返回 ''。 */
 let dingCache = { key: '', data: '' }
@@ -1611,8 +1797,9 @@ export function effectiveTtsModel(cfg = {}) {
   return cfg.model || DEFAULTS.model
 }
 
-/** 调用 MiMo-TTS，返回 base64 mp3。瞬态错误（超时/网络/5xx）自动重试一次。 */
-export async function synthesize(text, cfg) {
+/** 调用 MiMo-TTS，返回 base64 mp3。瞬态错误（超时/网络/5xx）自动重试一次。
+ *  opts.timeoutMs：预算封顶后的单次尝试超时；opts.signal：外部取消（浏览器断连）。 */
+export async function synthesize(text, cfg, opts = {}) {
   const apiKey = resolveApiKey(cfg)
   if (!apiKey) {
     const err = new Error('缺少 MiMo API Key：请在插件 config.apiKey、环境变量 MIMO_API_KEY 或 ~/.dsh/.credentials.yaml 的 refs 中提供。')
@@ -1649,7 +1836,9 @@ export async function synthesize(text, cfg) {
   const lang = normalizeLanguage(cfg.language)
   const configuredTimeout = Number(cfg.timeoutMs) > 1000 ? Number(cfg.timeoutMs) : DEFAULTS.timeoutMs
   const nonZhFloor = Number(cfg.otherLanguageTimeoutMs) > 1000 ? Number(cfg.otherLanguageTimeoutMs) : DEFAULTS.otherLanguageTimeoutMs
-  const requestTimeout = Math.max(configuredTimeout, lang === 'zh' ? 0 : nonZhFloor)
+  let requestTimeout = Math.max(configuredTimeout, lang === 'zh' ? 0 : nonZhFloor)
+  // 播报总预算封顶：剩余预算不足时宁可提前放弃，也不让宿主在浏览器超时后继续烧额度。
+  if (Number(opts.timeoutMs) > 1000) requestTimeout = Math.min(requestTimeout, Number(opts.timeoutMs))
   const longAudioThreshold = Number(cfg.longAudioSeconds) > 5 ? Number(cfg.longAudioSeconds) : DEFAULTS.longAudioSeconds
 
   const attempt = async (rateBoost = 0) => {
@@ -1658,6 +1847,7 @@ export async function synthesize(text, cfg) {
       ? { ...cfg, speechRateFactor: Math.min(1.9, speechRateFactor(cfg) + rateBoost) }
       : cfg
     const controller = new AbortController()
+    linkSignal(opts.signal, controller)
     const timer = setTimeout(() => controller.abort(), requestTimeout)
     try {
       const res = await fetch(`${baseUrl}/chat/completions`, {
@@ -1711,6 +1901,8 @@ export async function synthesize(text, cfg) {
       lastError = error
       const kind = classifyMimoError(error).kind
       error.mimoKind = kind
+      // 外部取消不是瞬态故障，绝不重试。
+      if (opts.signal && opts.signal.aborted) throw error
       // 只重试"再来一次可能就好"的错：超时、网络、5xx；鉴权/额度/参数错重试也没用。
       if (round === 0 && (kind === 'timeout' || kind === 'network' || kind === 'server')) continue
       throw error
@@ -1733,19 +1925,27 @@ export function estimateSeconds(base64Audio) {
  * 倍率 ≈1 时原样返回；任何失败都原样返回（变速是增强，不能让播报失败）。
  */
 
-// ffmpeg 可用性探测（懒加载、模块级缓存）：没有 ffmpeg 时语速静默失效，
-// 但 /state 会暴露这个状态，设置卡可以提示用户。
-let ffmpegProbe = null // null=未探测, true=可用, false=不可用
+// ffmpeg 可用性探测（懒加载、按可执行路径缓存）：没有 ffmpeg 时语速静默失效，
+// /config 会暴露这个状态，设置卡可以提示用户。探测失败 60 秒后允许重试（装上 ffmpeg 不用重启）。
+const ffmpegProbes = new Map() // ffmpeg 路径 → { ok, at }
+function ffmpegTimeoutOf(cfg = {}) {
+  return Number(cfg.ffmpegTimeoutMs) > 1000 ? Number(cfg.ffmpegTimeoutMs) : DEFAULTS.ffmpegTimeoutMs
+}
 export async function probeFfmpeg(cfg = {}) {
-  if (ffmpegProbe !== null) return ffmpegProbe
   const ffmpeg = String(cfg.ffmpegPath || process.env.DSH_FFMPEG || 'ffmpeg')
+  const now = Date.now()
+  const hit = ffmpegProbes.get(ffmpeg)
+  // 成功结果永久缓存；失败结果 60 秒内不重复探测。
+  if (hit && (hit.ok || now - hit.at < 60_000)) return hit.ok
+  let ok = false
   try {
-    const out = await runProcess(ffmpeg, ['-hide_banner', '-version'])
-    ffmpegProbe = out.code === 0
+    const out = await runProcess(ffmpeg, ['-hide_banner', '-version'], undefined, ffmpegTimeoutOf(cfg))
+    ok = out.code === 0
   } catch {
-    ffmpegProbe = false
+    ok = false
   }
-  return ffmpegProbe
+  ffmpegProbes.set(ffmpeg, { ok, at: now })
+  return ok
 }
 
 export async function applySpeechRate(base64Audio, cfg = {}) {
@@ -1771,7 +1971,7 @@ export async function applySpeechRate(base64Audio, cfg = {}) {
       '-b:a',
       '128k',
       outFile,
-    ])
+    ], undefined, ffmpegTimeoutOf(cfg))
     if (out.code !== 0) return base64Audio
     if (!existsSync(outFile)) return base64Audio
     const result = readFileSync(outFile)
@@ -1787,18 +1987,32 @@ export async function applySpeechRate(base64Audio, cfg = {}) {
   }
 }
 
-/** 跑一个子进程，stdin 喂 bytes，返回 { code }。 */
-function runProcess(file, args, inputBytes) {
+/** 跑一个子进程，stdin 喂 bytes，返回 { code, timedOut }。timeoutMs 超时杀进程，防止挂死的 ffmpeg 卡住整轮播报。 */
+function runProcess(file, args, inputBytes, timeoutMs = 0) {
   return new Promise((resolve) => {
     let child
     try {
       child = spawn(file, args, { windowsHide: true })
     } catch {
-      resolve({ code: -1 })
+      resolve({ code: -1, timedOut: false })
       return
     }
-    child.on('error', () => resolve({ code: -1 }))
-    child.on('close', (code) => resolve({ code }))
+    let timer = 0
+    let settled = false
+    const settle = (code, timedOut) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve({ code, timedOut })
+    }
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(function () {
+        try { child.kill() } catch {}
+        settle(-1, true)
+      }, Number(timeoutMs))
+    }
+    child.on('error', () => settle(-1, false))
+    child.on('close', (code) => settle(code, false))
     try {
       if (inputBytes && child.stdin) child.stdin.end(inputBytes)
     } catch {}

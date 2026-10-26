@@ -14,8 +14,15 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const ENABLED_KEY = 'dsh.mimoVoiceReport.enabled'
     const LANG_KEY = 'dsh.mimoVoiceReport.lang'
-    const CLIENT_VERSION = '1.31.0'
+    const CLIENT_VERSION = '1.32.0'
     const spoken = new Set()
+    // 已播记录只做"本页不重播"去重，长期运行的页面不能无限增长：超上限丢最旧的。
+    const SPOKEN_MAX = 64
+    function rememberSpoken(key) {
+      spoken.delete(key)
+      spoken.add(key)
+      while (spoken.size > SPOKEN_MAX) spoken.delete(spoken.values().next().value)
+    }
 
     // ——— 播放音量：设置卡写、播放侧读（持久化真身在宿主 config.volume） ———
     const volumeState = { value: 1 }
@@ -219,12 +226,12 @@ window.__ModuleLoader__.load({
       '.mv-report:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
       '.mv-report svg{width:16px;height:16px;display:block}',
       '.mv-report.is-off{opacity:.55}',
-      '.mv-report.is-loading svg{opacity:.5}',
+      '.mv-report.is-loading svg{opacity:.6;animation:mv-pulse 1.2s ease-in-out infinite}',
       '.mv-report.is-playing{color:var(--dsw-alias-brand-primary)}',
       '.mv-report.is-playing svg{animation:mv-pulse 1.1s ease-in-out infinite}',
       '.mv-report.is-blocked,.mv-report.is-error{color:var(--dsw-alias-state-warn-primary)}',
       '@keyframes mv-pulse{0%,100%{opacity:1}50%{opacity:.45}}',
-      '@media (prefers-reduced-motion: reduce){.mv-report.is-playing svg{animation:none}}',
+      '@media (prefers-reduced-motion: reduce){.mv-report.is-playing svg,.mv-report.is-loading svg{animation:none}}',
     ].join('\n')
 
     const CARD_CSS = [
@@ -234,11 +241,14 @@ window.__ModuleLoader__.load({
          光晕先亮（0ms）→ 立绘跟进（60ms，带轻微过冲）→ 气泡最后弹出（150ms，
          从立绘一侧展开：transform-origin 设在左下角，配 scaleX 起手，像"被说出来"）。
          三段错峰 + 不同缓动，比原来的同时缩放更有层次。 */
-      '.mv-glow{animation:mv-glow-in .5s ease both}',
+      // 光晕入场只做形变，opacity 交给 .mv-card.is-* 的规则 + transition 控制。
+      // 不能给这段动画加 both/forwards：动画填充值优先级高于普通声明，
+      // 会把 is-loading/.28、is-done/.10 的透明度全部压成 1。
+      '.mv-glow{animation:mv-glow-in .6s cubic-bezier(.22,1,.36,1) both}',
       // 入场/退场放在外层包裹 .mv-figwrap；浮动放在裁剪框 .mv-figure 本身。
       '.mv-figwrap{flex:0 0 auto;animation:mv-fig-in .52s cubic-bezier(.16,1.02,.3,1.12) 60ms both}',
       '.mv-bubble{animation:mv-bubble-in .46s cubic-bezier(.16,1.06,.32,1.1) 150ms both;transform-origin:0% 100%}',
-      '@keyframes mv-glow-in{from{opacity:0;transform:scale(.7)}to{opacity:1;transform:none}}',
+      '@keyframes mv-glow-in{from{transform:scale(.7)}to{transform:none}}',
       '@keyframes mv-fig-in{0%{opacity:0;transform:translate(14px,22px) scale(.82) rotate(-2.5deg)}70%{opacity:1}100%{opacity:1;transform:none}}',
       '@keyframes mv-bubble-in{0%{opacity:0;transform:translate(-6px,10px) scale(.9)}60%{opacity:1;transform:translate(0,-2px) scale(1.008)}100%{opacity:1;transform:none}}',
       /* —— 退场：反向收回，比入场快（0.3s），气泡先走、立绘后走 —— */
@@ -250,6 +260,8 @@ window.__ModuleLoader__.load({
       '@keyframes mv-glow-out{to{opacity:0;transform:scale(.85)}}',
       // 品牌色光晕：垫在卡片后面，准备/播放时最亮，播完慢慢暗下去。
       '.mv-glow{position:absolute;right:-30px;bottom:-34px;width:230px;height:190px;border-radius:50%;background:var(--dsw-alias-brand-primary);opacity:0;filter:blur(46px);pointer-events:none;z-index:-1;transition:opacity .5s ease}',
+      // 首帧透明度从 0 起算，让上面这条 transition 真的有一次淡入（否则挂载即达终值、不触发过渡）。
+      '@starting-style{.mv-glow{opacity:0}}',
       '.mv-card.is-loading .mv-glow,.mv-card.is-playing .mv-glow{opacity:.28}',
       '.mv-card.is-done .mv-glow{opacity:.10}',
       // 立绘：圆角小卡 + 顶部高光 + 呼吸浮动。
@@ -265,11 +277,14 @@ window.__ModuleLoader__.load({
       // 气泡：毛玻璃、大圆角、靠尾巴一侧收小角。
       '.mv-bubble{position:relative;min-width:150px;max-width:300px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:18px;border-bottom-left-radius:8px;padding:12px 30px 10px 14px;box-shadow:0 18px 40px rgba(0,0,0,.30);backdrop-filter:blur(16px) saturate(1.3);-webkit-backdrop-filter:blur(16px) saturate(1.3);pointer-events:auto;transition:border-color .25s ease}',
       '.mv-bubble:after{content:"";position:absolute;left:-5.5px;bottom:18px;width:11px;height:11px;background:var(--dsw-alias-bg-overlay);border-left:1px solid var(--dsw-alias-border-l1);border-bottom:1px solid var(--dsw-alias-border-l1);transform:rotate(45deg);border-bottom-left-radius:3px}',
-      // 正文：每个新出现的字带一次 4px 上浮。
+      // 正文：每个新出现的字带一次 4px 上浮；上浮只在 playing 阶段挂，
+      // 否则 done/error 一次性补齐的那一大批字会在同一帧集体抖动。
       '.mv-text{font-size:14px;line-height:1.75;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word;min-height:1.75em}',
-      '.mv-c{display:inline-block;animation:mv-char .24s ease both}',
+      '.mv-c{display:inline-block}',
+      '.mv-card.is-playing .mv-c{animation:mv-char .24s ease both}',
       '@keyframes mv-char{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}',
-      '.mv-caret{display:inline-block;width:2.5px;height:1em;margin-left:2px;vertical-align:-2px;border-radius:2px;background:var(--dsw-alias-brand-primary);animation:mv-blink 1s steps(2,start) infinite}',
+      // 光标用负外边距吃掉自身宽度：行尾刚好放不下时不会把光标单独挤到下一行。
+      '.mv-caret{display:inline-block;width:2.5px;height:1em;margin-left:2px;margin-right:-4.5px;vertical-align:-2px;border-radius:2px;background:var(--dsw-alias-brand-primary);animation:mv-blink 1s steps(2,start) infinite}',
       '.mv-dim{color:var(--dsw-alias-label-secondary)}',
       '.mv-trans{margin-top:7px;padding-top:7px;border-top:1px solid var(--dsw-alias-border-l1);font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word}',
       // 进度线：准备时来回扫，播放时跟音频走，播完停在满格再淡出。
@@ -277,8 +292,9 @@ window.__ModuleLoader__.load({
       '.mv-card.is-loading .mv-bar,.mv-card.is-playing .mv-bar{opacity:1}',
       '.mv-card.is-done .mv-bar{opacity:.45}',
       '.mv-bar>i{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:2px;background:var(--dsw-alias-brand-primary);transition:width .2s linear}',
+      // 扫光只动 transform（合成器线程），不动 left（会触发布局）。
       '.mv-card.is-loading .mv-bar>i{width:34%;animation:mv-sweep 1.1s ease-in-out infinite}',
-      '@keyframes mv-sweep{0%{left:-34%}100%{left:100%}}',
+      '@keyframes mv-sweep{0%{transform:translateX(-106%)}100%{transform:translateX(306%)}}',
       // 状态行：小圆点 + 说明，播放中圆点呼吸。
       '.mv-meta{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary);opacity:.9}',
       '.mv-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-secondary);flex:0 0 auto}',
@@ -297,7 +313,7 @@ window.__ModuleLoader__.load({
       '@keyframes mv-shake{0%,100%{transform:none}25%{transform:translateX(-3px)}60%{transform:translateX(2px)}}',
       '@keyframes mv-blink{0%,100%{opacity:1}50%{opacity:0}}',
       // 动效敏感用户：全部换成纯淡入淡出，浮动/呼吸/抖动一律关掉。
-      '@media (prefers-reduced-motion: reduce){.mv-figwrap,.mv-bubble{animation:mv-fade .18s ease both}.mv-card.is-leaving .mv-figwrap,.mv-card.is-leaving .mv-bubble{animation:mv-fadeout .18s ease forwards}.mv-glow{animation:none}.mv-figure,.mv-figure img,.mv-c,.mv-card.is-blocked,.mv-card.is-error,.mv-dot,.mv-card.is-loading .mv-bar>i,.mv-caret{animation:none}}',
+      '@media (prefers-reduced-motion: reduce){.mv-figwrap,.mv-bubble{animation:mv-fade .18s ease both}.mv-card.is-leaving .mv-figwrap,.mv-card.is-leaving .mv-bubble{animation:mv-fadeout .18s ease forwards}.mv-glow{animation:none}.mv-figure,.mv-figure img,.mv-c,.mv-card.is-playing .mv-c,.mv-card.is-blocked,.mv-card.is-error,.mv-dot,.mv-card.is-loading .mv-bar>i,.mv-caret{animation:none}}',
       '@keyframes mv-fade{from{opacity:0}to{opacity:1}}',
       '@keyframes mv-fadeout{from{opacity:1}to{opacity:0}}',
       '@media (max-width:720px){.mv-card{right:14px;bottom:96px;gap:8px}.mv-figure{width:92px;height:122px;border-radius:14px}.mv-bubble{max-width:calc(100vw - 150px);border-radius:16px;border-bottom-left-radius:7px;padding:10px 26px 9px 12px}.mv-text{font-size:13.5px}}',
@@ -454,6 +470,38 @@ window.__ModuleLoader__.load({
       const audio = React.useRef(null)
       const timer = React.useRef(0)
       const retryCleanup = React.useRef(null)
+      // 请求代次：只有最新一次 speak 能更新状态/播放；切会话、关闭语音、重试都会让它失效。
+      const requestSeq = React.useRef(0)
+      const requestAbort = React.useRef(null)
+      // 播放代次：同一请求内旧 <audio> 的事件（含被替换后的手势补播）不能再驱动浮层。
+      const playbackSeq = React.useRef(0)
+
+      /** 停掉当前播放并让它的回调全部失效（不更新 React 状态，可安全在清理函数里调）。 */
+      function stopPlaybackForInvalidation() {
+        playbackSeq.current += 1
+        const el = audio.current
+        if (el) {
+          el.onplaying = null
+          el.onended = null
+          el.onerror = null
+          try { el.pause() } catch {}
+        }
+        stopReveal()
+        if (retryCleanup.current) {
+          retryCleanup.current()
+          retryCleanup.current = null
+        }
+      }
+
+      /** 让在途请求与在途播放同时失效：切会话 / 关闭语音 / 发起新请求前调用。 */
+      function invalidateRequests() {
+        requestSeq.current += 1
+        if (requestAbort.current) {
+          try { requestAbort.current.abort() } catch {}
+          requestAbort.current = null
+        }
+        stopPlaybackForInvalidation()
+      }
 
       React.useEffect(function () {
         const loc = localeInfo()
@@ -463,6 +511,8 @@ window.__ModuleLoader__.load({
           .then(function (response) { return response.json() })
           .then(function (data) {
             if (data && Number.isFinite(Number(data.volume))) setCurrentVolume(data.volume)
+            // 顺带同步立绘版本：不打开设置卡也能拿到 mtime，换图后的缓存击穿立即生效。
+            if (data && data.avatarVersion) avatarVersion = Number(data.avatarVersion) || 0
           })
           .catch(function () {})
         const heartbeat = setInterval(function () {
@@ -474,15 +524,16 @@ window.__ModuleLoader__.load({
           alive.current = false
           if (timer.current) clearTimeout(timer.current)
           if (retryCleanup.current) retryCleanup.current()
-          stopReveal()
-          try {
-            if (audio.current) {
-              audio.current.pause()
-              audio.current.removeAttribute('src')
-            }
-          } catch {}
+          invalidateRequests()
         }
       }, [])
+
+      // 切会话时，上一会话的在途请求/播放立刻作废，避免旧会话的声音在新会话页面上冒出来。
+      React.useEffect(function () {
+        return function () {
+          invalidateRequests()
+        }
+      }, [sessionId])
 
       React.useEffect(function () {
         const before = prevRunning.current
@@ -498,22 +549,28 @@ window.__ModuleLoader__.load({
         }
       }, [running, sessionId])
 
-      function armGestureRetry() {
+      function armGestureRetry(playbackAlive) {
         if (retryCleanup.current) return
         const el = audio.current
         if (!el || !el.src) return
         const tryPlay = function () {
+          // 代次已失效（新请求/切会话/已关闭）就不再补播旧音频。
+          if (playbackAlive && !playbackAlive()) {
+            if (retryCleanup.current) retryCleanup.current()
+            retryCleanup.current = null
+            return
+          }
           if (retryCleanup.current) retryCleanup.current()
           retryCleanup.current = null
           const playing = el.play()
           if (playing && typeof playing.then === 'function') {
             playing
               .then(function () {
-                if (alive.current) setStatus('playing')
+                if (playbackAlive && playbackAlive()) setStatus('playing')
                 report({ event: 'played-after-gesture', sessionId: sessionId })
               })
               .catch(function (error) {
-                if (alive.current) setStatus('blocked')
+                if (playbackAlive && playbackAlive()) setStatus('blocked')
                 report({ event: 'play-blocked-again', sessionId: sessionId, message: String((error && error.message) || error) })
               })
           }
@@ -531,8 +588,13 @@ window.__ModuleLoader__.load({
         } catch {}
       }
 
-      function play(data) {
+      function play(data, isCurrent) {
         return new Promise(function (resolve) {
+          // 播放代次：本函数创建的 <audio> 事件只在自己的代次里生效。
+          const token = ++playbackSeq.current
+          const playbackAlive = function () {
+            return isCurrent() && playbackSeq.current === token
+          }
           if (typeof Audio === 'undefined') {
             setStatus('error')
             setDetail(L.noAudio)
@@ -553,9 +615,8 @@ window.__ModuleLoader__.load({
           el.volume = volumeState.value
           let started = false
           el.onplaying = function () {
-            if (started) return
+            if (started || !playbackAlive()) return
             started = true
-            if (!alive.current) return
             // 被自动播放拦下后靠用户手势补播时，浮层可能已在离场路上，这里重新亮出来。
             showCard({
               phase: 'playing',
@@ -570,6 +631,7 @@ window.__ModuleLoader__.load({
             report({ event: 'card-playing', sessionId: sessionId, chars: Array.from(text).length, duration: Math.round((el.duration || 0) * 100) / 100 })
           }
           el.onended = function () {
+            if (!playbackAlive()) return
             stopReveal()
             emit({ phase: 'done', shown: Array.from(text).length, transShown: transTotal })
             // 自适应停留：基础 2.8s + 每字 60ms（原文+译文），上限 9s，保证双语字幕读得完。
@@ -579,6 +641,7 @@ window.__ModuleLoader__.load({
             report({ event: 'card-done', sessionId: sessionId, chars: Array.from(text).length })
           }
           el.onerror = function () {
+            if (!playbackAlive()) return
             stopReveal()
             emit({ phase: 'error', text: text })
             hideCardSoon(4000)
@@ -590,19 +653,18 @@ window.__ModuleLoader__.load({
           if (started_ && typeof started_.then === 'function') {
             started_
               .then(function () {
-                if (!alive.current) return
+                if (!playbackAlive()) return
                 setStatus('playing')
                 report({ event: 'played', sessionId: sessionId, turn: data.turn, chars: Array.from(text).length, bytes: String(data.audio || '').length })
               })
               .catch(function (error) {
-                if (alive.current) {
-                  setStatus('blocked')
-                  setDetail(String((error && error.message) || error))
-                }
+                if (!playbackAlive()) return
+                setStatus('blocked')
+                setDetail(String((error && error.message) || error))
                 emit({ phase: 'blocked', text: text })
                 hideCardSoon(6000)
                 report({ event: 'play-blocked', sessionId: sessionId, message: String((error && error.message) || error) })
-                armGestureRetry()
+                armGestureRetry(playbackAlive)
               })
               .then(resolve, resolve)
           } else {
@@ -614,20 +676,37 @@ window.__ModuleLoader__.load({
 
       function speak(force) {
         if (!sessionId) return Promise.resolve()
+        // 新请求开始：旧的在途请求立刻作废（abort + 代次失效），旧播放也停掉。
+        const seq = ++requestSeq.current
+        if (requestAbort.current) {
+          try { requestAbort.current.abort() } catch {}
+        }
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+        requestAbort.current = controller
+        const isCurrent = function () {
+          return alive.current && requestSeq.current === seq
+        }
+        stopPlaybackForInvalidation()
         setStatus('loading')
         showCard({ phase: 'loading', text: '', shown: 0 })
         // 宿主最坏要等 摘要 + TTS（各带一次重试）两段超时；给请求一个总上限，别让按钮无限转圈。
-        const signal =
-          typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(100000) : undefined
+        const REQUEST_TIMEOUT_MS = 100000
+        const timeoutId = controller
+          ? setTimeout(function () { try { controller.abort() } catch {} }, REQUEST_TIMEOUT_MS)
+          : 0
+        const clearRequest = function () {
+          if (timeoutId) clearTimeout(timeoutId)
+          if (requestAbort.current === controller) requestAbort.current = null
+        }
         return fetch('/mimo-voice/report', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId: sessionId, force: force === true }),
-          signal: signal,
+          signal: controller ? controller.signal : undefined,
         })
           .then(function (response) { return response.json() })
           .then(function (data) {
-            if (!alive.current) return
+            if (!isCurrent()) return
             if (!data || data.ok !== true) {
               if (data && (data.code === 'stale' || data.code === 'no-turn')) {
                 setStatus('idle')
@@ -647,7 +726,7 @@ window.__ModuleLoader__.load({
               beginLeave()
               return
             }
-            spoken.add(key)
+            rememberSpoken(key)
             // MiMo 不可用时宿主会返回内置提示音（fallback:true）：照播，但气泡要说明原因。
             const isFallback = data.fallback === true
             // 语种翻译失败时宿主回落中文播报，并带回 translateError——必须让用户看见原因。
@@ -668,10 +747,11 @@ window.__ModuleLoader__.load({
                 : '',
             })
             if (isFallback) report({ event: 'report-fallback', sessionId: sessionId, kind: data.kind, message: data.message })
-            return play(data)
+            return play(data, isCurrent)
           })
           .catch(function (error) {
-            if (!alive.current) return
+            // 被 invalidate（新请求/切会话/关语音）主动 abort 的旧请求：静默丢弃，不更新任何状态。
+            if (!isCurrent()) return
             const timedOut = error && (error.name === 'TimeoutError' || error.name === 'AbortError')
             const why = timedOut ? '等太久了，这次先放弃（宿主可能仍在处理，稍后点小喇叭重试）' : String((error && error.message) || error)
             setStatus('error')
@@ -679,6 +759,13 @@ window.__ModuleLoader__.load({
             emit({ phase: 'error', text: why })
             hideCardSoon(4500)
             report({ event: 'report-error', sessionId: sessionId, message: why })
+          })
+          .then(function (value) {
+            clearRequest()
+            return value
+          }, function (error) {
+            clearRequest()
+            throw error
           })
       }
 
@@ -691,10 +778,8 @@ window.__ModuleLoader__.load({
         setEnabled(next)
         writeEnabled(next)
         if (!next) {
-          try {
-            if (audio.current) audio.current.pause()
-          } catch {}
-          stopReveal()
+          // 关闭语音：在途请求与播放同时作废，晚到的响应不再出声。
+          invalidateRequests()
           beginLeave()
           setStatus('idle')
         }
@@ -757,6 +842,10 @@ window.__ModuleLoader__.load({
       const v = useView()
       const L = pickText()
       const [avatarOk, setAvatarOk] = React.useState(true)
+      // 浮层每次重新弹出都重试立绘：一次瞬时加载失败（如插件热重载的路由空窗）不再永久关掉立绘。
+      React.useEffect(function () {
+        if (v.visible) setAvatarOk(true)
+      }, [v.visible])
       if (!v.visible) return null
 
       const full = String(v.text || '')
@@ -902,6 +991,8 @@ window.__ModuleLoader__.load({
       const [language, setLanguageState] = React.useState('zh')
       const [languages, setLanguages] = React.useState({ zh: '中文（不翻译）', en: 'English', ja: '日本語', ko: '한국어' })
       const [speechRate, setSpeechRate] = React.useState(1)
+      // null=未知（读取中）；false=没检测到 ffmpeg，语速调整不会生效。
+      const [ffmpegOk, setFfmpegOk] = React.useState(null)
       const previewAudio = React.useRef(null)
 
       function applyPersonaPrompt(p) {
@@ -946,6 +1037,8 @@ window.__ModuleLoader__.load({
             if (data && data.language) setLanguageState(String(data.language))
             if (data && data.languages && typeof data.languages === 'object') setLanguages(data.languages)
             if (data && data.speechRate && Number.isFinite(Number(data.speechRate.factor))) setSpeechRate(Number(data.speechRate.factor))
+            // 宿主探测的 ffmpeg 可用性：缺失时在语速区给出可见警告（而不是静默不生效）。
+            setFfmpegOk(data && data.runtime ? data.runtime.ffmpeg === true : null)
             if (data && data.avatarVersion) avatarVersion = Number(data.avatarVersion) || 0
             const p = (data && data.persona) || {}
             setCallMe(String(p.callMe || ''))
@@ -1456,7 +1549,6 @@ window.__ModuleLoader__.load({
               : '选择其他语种后，语音汇报会切换成该语种（中文稿由 MiMo 整段翻译，保留人设口吻）；气泡字幕随语音显示该语种原文，播完后追加中文译文。翻译失败时本轮回落中文播报。方言音色只在中文语种下出现在上面的音色列表里。'
           ),
           h('div', { className: 'mv-key-title', key: 'srt' }, '语速'),
-          h('div', { className: 'mv-key-title', key: 'srt' }, '语速'),
           h(
             'div',
             { className: 'mv-key-row', key: 'srrow' },
@@ -1483,8 +1575,11 @@ window.__ModuleLoader__.load({
             { className: 'mv-key-note', key: 'srnote' },
             hostApi < 4
               ? '宿主半还是旧版本（重启 DSH 后这里才能调语速）。'
-              : '合成后用 ffmpeg 变速不变调（确定可控）。默认：中文 1.00× / 英语 1.08× / 日语 1.12× / 韩语 1.10×；**切换语种会自动套用该语种默认值**（想固定就用这里的滑杆覆盖）。'
+              : '合成后用 ffmpeg 变速不变调（确定可控）。默认：中文 1.00× / 英语 1.08× / 日语 1.12× / 韩语 1.25×；切换语种会自动套用该语种默认值（想固定就用这里的滑杆覆盖）。'
           ),
+          ffmpegOk === false
+            ? h('div', { className: 'mv-key-warn', key: 'srffwarn' }, '未检测到 ffmpeg：语速调整不会生效，音频将按原速播放。安装 ffmpeg 或设置环境变量 DSH_FFMPEG 指向它的路径。')
+            : null,
           h('div', { className: 'mv-key-title', key: 'ct' }, '称呼'),
           h(
             'div',
